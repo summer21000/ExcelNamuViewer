@@ -4,11 +4,11 @@
 
 ---
 
-## ⬇️ 바로 다운로드 (빌드 불필요)
+## 바로 다운로드 (빌드 불필요)
 
 > **소스 빌드 / Python 설치 없이 즉시 사용할 수 있습니다.**
 >
-> 👉 **[GitHub Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest)** 에서 최신 `ExcelView.exe` (≈245 MB) 를 다운로드 → **더블클릭만 하면 실행**
+> **[GitHub Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest)** 에서 최신 `ExcelView.exe` (≈245 MB) 를 다운로드 → **더블클릭만 하면 실행**
 >
 > - Windows 10 / 11 (64bit) 에서 바로 동작
 > - Python, pip, git clone 모두 불필요 — 단일 실행 파일
@@ -62,7 +62,7 @@ python main.py
 
 ## 사용법
 
-> 💡 **빌드 없이 즉시 쓰고 싶다면** → [Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest) 에서 `ExcelView.exe` 다운로드 → 더블클릭.
+> **빌드 없이 즉시 쓰고 싶다면** → [Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest) 에서 `ExcelView.exe` 다운로드 → 더블클릭.
 > ⏳ 첫 실행은 압축 해제 + Qt WebEngine 초기화로 **10~20초** 정도 검은 화면일 수 있습니다.
 
 1. 실행하면 **Sheet1 (위장 시트)** 가 먼저 보임. 일하는 척 하기 좋은 빈 양식이 떠있음.
