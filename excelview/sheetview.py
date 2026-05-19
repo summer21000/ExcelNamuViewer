@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from PySide6.QtCore import QItemSelectionModel, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QKeyEvent, QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableView, QToolTip, QWidget
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import (
+    QAbstractItemView, QFrame, QHeaderView, QMenu, QTableView, QToolTip, QWidget,
+)
 
 
 # 셀 모델 커스텀 데이터 슬롯
@@ -27,19 +30,29 @@ def cell_address(row: int, col: int) -> str:
 class SheetView(QTableView):
     cellSelected = Signal(int, int, str, str)
     imageCellActivated = Signal(str, str)   # url, alt_or_label
-    linkCellActivated = Signal(str)         # href
-    visibleColsChanged = Signal(int)        # 가시 컬럼 수 (resize 시)
+    linkCellActivated = Signal(str)         # href — 같은 시트에서 열기 (더블클릭 / 메뉴 "열기")
+    linkOpenInNewSheet = Signal(str)        # href — 새 시트에서 열기
+    visibleColsChanged = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("SheetView")
+        self._frozen: QTableView | None = None
+        self._frozen_enabled = False
         self._build_appearance()
         self._build_model(2000, 60)
+        self._build_frozen_view()
 
         # 좌우 스크롤 막기 — wrap 으로 처리
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.doubleClicked.connect(self._on_double_clicked)
         self.clicked.connect(self._on_single_clicked)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+        self.horizontalHeader().sectionResized.connect(self._sync_frozen_section)
+        self.verticalScrollBar().valueChanged.connect(
+            lambda _v: self._update_frozen_geometry()
+        )
 
     # ------------------------------------------------------------------ public
     def setCellValue(
@@ -166,6 +179,74 @@ class SheetView(QTableView):
             self._model.index(0, 0),
             QItemSelectionModel.ClearAndSelect,
         )
+        if self._frozen is not None:
+            self._frozen.setModel(self._model)
+            self._update_frozen_geometry()
+
+    # ------------------------------------------------------------------ frozen pane
+    def _build_frozen_view(self) -> None:
+        fv = QTableView(self)
+        fv.setObjectName("SheetView")
+        fv.setFocusPolicy(Qt.NoFocus)
+        fv.setSelectionMode(QAbstractItemView.SingleSelection)
+        fv.setSelectionBehavior(QAbstractItemView.SelectItems)
+        fv.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        fv.setFrameShape(QFrame.NoFrame)
+        fv.setShowGrid(True)
+        fv.setGridStyle(Qt.SolidLine)
+        fv.verticalHeader().hide()
+        fv.horizontalHeader().hide()
+        fv.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        fv.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 헤더 행 시각 구분 — 살짝 다른 배경
+        fv.setStyleSheet(
+            "QTableView { background:#fafafa; gridline-color:#d4d4d4;"
+            " selection-background-color:rgba(33,115,70,30); }"
+        )
+        fv.setModel(self._model)
+        fv.doubleClicked.connect(self._on_double_clicked)
+        fv.clicked.connect(self._on_single_clicked)
+        fv.hide()
+        self._frozen = fv
+
+    def setFrozenTopRow(self, enabled: bool) -> None:
+        self._frozen_enabled = bool(enabled)
+        if self._frozen is None:
+            return
+        if self._frozen_enabled:
+            self._update_frozen_geometry()
+            self._frozen.show()
+            self._frozen.raise_()
+        else:
+            self._frozen.hide()
+
+    def _sync_frozen_section(self, logical_idx: int, _old: int, new_size: int) -> None:
+        if self._frozen is None:
+            return
+        self._frozen.setColumnWidth(logical_idx, new_size)
+        self._update_frozen_geometry()
+
+    def _update_frozen_geometry(self) -> None:
+        if self._frozen is None or not self._frozen_enabled:
+            return
+        vh_w = self.verticalHeader().width()
+        hh_h = self.horizontalHeader().height()
+        row_h = self.rowHeight(0)
+        if row_h <= 0:
+            row_h = self.verticalHeader().defaultSectionSize()
+        fw = self.frameWidth()
+        self._frozen.setGeometry(
+            vh_w + fw,
+            hh_h + fw,
+            self.viewport().width(),
+            row_h,
+        )
+        # 모든 컬럼 폭 동기화 (한 번 더 안전장치)
+        for c in range(self._model.columnCount()):
+            self._frozen.setColumnWidth(c, self.columnWidth(c))
+        # frozen 은 첫 row 만 — viewport 의 origin 을 (0,0) 으로 강제
+        self._frozen.verticalScrollBar().setValue(0)
+        self._frozen.horizontalScrollBar().setValue(0)
 
     # ------------------------------------------------------------------ events
     def keyPressEvent(self, e: QKeyEvent) -> None:
@@ -195,6 +276,23 @@ class SheetView(QTableView):
         if link:
             self.linkCellActivated.emit(str(link))
 
+    def _show_context_menu(self, pos) -> None:
+        idx = self.indexAt(pos)
+        if not idx.isValid():
+            return
+        link = idx.data(LINK_URL_ROLE)
+        if not link:
+            return
+        link = str(link)
+        menu = QMenu(self)
+        act_open = QAction("열기", menu)
+        act_new = QAction("새 시트로 열기", menu)
+        act_open.triggered.connect(lambda: self.linkCellActivated.emit(link))
+        act_new.triggered.connect(lambda: self.linkOpenInNewSheet.emit(link))
+        menu.addAction(act_open)
+        menu.addAction(act_new)
+        menu.exec(self.viewport().mapToGlobal(pos))
+
     def _on_single_clicked(self, idx) -> None:
         if not idx.isValid():
             return
@@ -214,4 +312,5 @@ class SheetView(QTableView):
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
+        self._update_frozen_geometry()
         self.visibleColsChanged.emit(self.visible_col_count())

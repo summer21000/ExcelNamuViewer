@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import QMainWindow, QVBoxLayout, QWidget
 
+from excelview.decoysheets import decoy_sheet2, decoy_sheet3
 from excelview.formulabar import FormulaBar
 from excelview.imagedialog import ImageDialog
 from excelview.namuformatter import format_positioned
@@ -17,7 +18,7 @@ from excelview.statusbar import ExcelStatusBar
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Book1 - Excel")
+        self.setWindowTitle("Sheet1 - Book1 - Excel")
         self.resize(1280, 800)
 
         central = QWidget(self)
@@ -66,9 +67,22 @@ class MainWindow(QMainWindow):
         self.sheet.cellSelected.connect(self._on_cell_selected)
         self.sheet.imageCellActivated.connect(self._on_image_cell)
         self.sheet.linkCellActivated.connect(self._on_link_cell)
+        self.sheet.linkOpenInNewSheet.connect(self._on_link_cell_new_sheet)
         self.sheet.visibleColsChanged.connect(self._on_visible_cols)
+        self.tabs.sheetChanged.connect(self._on_sheet_changed)
         self.formula.formulaCommitted.connect(self._on_formula_committed)
         self.status.zoomChanged.connect(self._on_zoom_changed)
+
+        # Sheet1 은 위장(decoy) 고정. Sheet2~ 는 namu 작업 영역.
+        self._sheets: dict[int, dict] = {
+            0: {"type": "decoy2"},  # Sheet1 = 위장 시트 (주간 업무)
+            1: {"type": "namu", "tokens": [], "title": "", "url": "", "page_w": 1280},
+        }
+        self._current_sheet = 0
+        self._pending_new_sheet: int | None = None
+        self.sheet.setFrozenTopRow(True)
+        # 시작 시 Sheet1 (위장) 표시
+        self._on_sheet_changed(0)
 
         self.status.setSummary("준비")
         self._sheet_base_font: QFont = self.sheet.font()
@@ -82,15 +96,43 @@ class MainWindow(QMainWindow):
             s = QShortcut(QKeySequence(seq), self)
             s.activated.connect(self._go_back)
 
+        # Ctrl+Z — 어느 시트에서든 즉시 Sheet1 (위장) 으로 전환
+        panic = QShortcut(QKeySequence("Ctrl+Z"), self)
+        panic.activated.connect(lambda: self.tabs.selectSheet(0))
+
     # ------------------------------------------------------------------ search
+    def _ensure_namu_sheet_active(self) -> None:
+        """현재 시트가 위장(decoy) 이면 namu 시트로 전환. 없으면 새로 만듦."""
+        cur = self._sheets.get(self._current_sheet, {})
+        if cur.get("type") == "namu":
+            return
+        for idx, info in self._sheets.items():
+            if info.get("type") == "namu":
+                self.tabs.selectSheet(idx)
+                return
+        new_idx = self.tabs.addSheet()
+        self._sheets[new_idx] = {
+            "type": "namu", "tokens": [], "title": "",
+            "url": "", "page_w": 1280,
+        }
+        self.tabs.selectSheet(new_idx)
+
     def _on_search(self, title: str) -> None:
+        # 새 시트로 열기 진행 중이 아니라면 namu 시트가 활성 상태여야
+        if self._pending_new_sheet is None:
+            self._ensure_namu_sheet_active()
         self.status.setStatusText(f"'{title}' 로드 중...")
         self.status.setSummary("")
         self.loader.fetch(title)
 
     def _on_load_started(self, title: str) -> None:
-        self.setWindowTitle(f"{title} - Excel")
         self.ribbon.search_edit.setText(title)
+        # 윈도우 타이틀은 sheet 이름 기준 (문서 제목 노출 안 함)
+        self._update_window_title()
+
+    def _update_window_title(self) -> None:
+        name = self.tabs.sheetName(self._current_sheet)
+        self.setWindowTitle(f"{name} - Book1 - Excel")
 
     def _on_load_progress(self, p: int) -> None:
         if p < 100:
@@ -100,11 +142,32 @@ class MainWindow(QMainWindow):
 
     def _on_body_extracted(self, title: str, tokens: list, url: str,
                            page_w: int = 1280, page_h: int = 0) -> None:
-        self._last_title = title
-        self._last_tokens = tokens
-        self._last_url = url
-        self._last_page_w = page_w
-        self._refill()
+        # 새 시트로 열기 진행 중이면 그 시트에 저장 + 활성화
+        if self._pending_new_sheet is not None:
+            target = self._pending_new_sheet
+            self._pending_new_sheet = None
+            self._sheets[target] = {
+                "type": "namu", "tokens": tokens, "title": title,
+                "url": url, "page_w": page_w,
+            }
+            self.tabs.selectSheet(target)
+            return
+
+        # 현재 시트가 namu 타입이면 그것에 저장. 아니면 sheet0 에 저장 (기본 namu 시트)
+        target = self._current_sheet if self._sheets.get(self._current_sheet, {}).get("type") == "namu" else 0
+        self._sheets[target] = {
+            "type": "namu", "tokens": tokens, "title": title,
+            "url": url, "page_w": page_w,
+        }
+        # 현재 시트가 그 target 이면 화면 갱신
+        if self._current_sheet == target:
+            self._last_title = title
+            self._last_tokens = tokens
+            self._last_url = url
+            self._last_page_w = page_w
+            self._refill()
+        else:
+            self.tabs.selectSheet(target)
 
     def _refill(self) -> None:
         if not self._last_tokens:
@@ -122,8 +185,50 @@ class MainWindow(QMainWindow):
 
     def _on_visible_cols(self, _cols: int) -> None:
         # resize debounce — 200ms 동안 추가 resize 없으면 재포맷
-        if self._last_tokens:
+        if self._current_sheet == 0 and self._last_tokens:
             self._refill_timer.start(200)
+
+    # ------------------------------------------------------------------ sheet tabs
+    def _on_sheet_changed(self, idx: int) -> None:
+        """sheet 인덱스별 데이터 표시. namu 타입은 저장된 tokens 로 재렌더."""
+        self._current_sheet = idx
+        info = self._sheets.get(idx, {"type": "namu"})
+        kind = info.get("type", "namu")
+        if kind == "decoy2":
+            self.sheet.clearAll()
+            self.sheet.fillMatrix(decoy_sheet2(), start_row=0, start_col=0)
+            self.status.setSummary("주간 업무 진행 현황")
+            return
+        if kind == "decoy3":
+            self.sheet.clearAll()
+            self.sheet.fillMatrix(decoy_sheet3(), start_row=0, start_col=0)
+            self.status.setSummary("자재 입출고 내역")
+            return
+        # namu 시트
+        self._last_title = info.get("title", "")
+        self._last_tokens = info.get("tokens", [])
+        self._last_url = info.get("url", "")
+        self._last_page_w = info.get("page_w", 1280)
+        if self._last_tokens:
+            self._refill()
+            self.ribbon.search_edit.setText(self._last_title)
+        else:
+            self.sheet.clearAll()
+            self.status.setSummary(f"{self.tabs.sheetName(idx)} (비어 있음)")
+        self._update_window_title()
+
+    def _on_link_cell_new_sheet(self, href: str) -> None:
+        """우클릭 → '새 시트로 열기'. 새 sheet 탭 만들고 거기에 로드."""
+        if not href:
+            return
+        new_idx = self.tabs.addSheet()
+        self._sheets[new_idx] = {
+            "type": "namu", "tokens": [], "title": href,
+            "url": "", "page_w": 1280,
+        }
+        self._pending_new_sheet = new_idx
+        # 현재 시트는 그대로 두고 — fetch 끝나면 _on_body_extracted 에서 새 탭 활성화
+        self._on_search(href)
 
     def _on_fetch_failed(self, title: str, msg: str) -> None:
         self.status.setStatusText(f"실패: {msg}")
@@ -229,8 +334,8 @@ class MainWindow(QMainWindow):
         self._last_url = url
         self._last_page_w = page_w
         self._refill()
-        self.setWindowTitle(f"{title} - Excel")
         self.ribbon.search_edit.setText(title)
+        self._update_window_title()
         self.ribbon.setBackEnabled(bool(self._history))
 
     # ------------------------------------------------------------------ shutdown

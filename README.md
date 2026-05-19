@@ -3,12 +3,13 @@
 엑셀 처럼 위장된 나무위키 뷰어. PySide6 + QtWebEngine 으로 구현.
 
 - namu.wiki 페이지의 전체 시각 구조를 좌표 기반으로 엑셀 셀 그리드에 매핑
-- 이미지는 셀에 `📷 [사진 보기]` placeholder 로 표시 → 더블 클릭하면 별도 다이얼로그로 사진 표시
-- 인라인 링크 더블 클릭 시 해당 문서로 이동
+- 이미지는 셀에 `📷 [사진 보기]` placeholder 로 표시 → 더블 클릭 시 별창에 사진 표시
+- 인라인 링크 더블 클릭으로 이동 + 우클릭 → "새 시트로 열기" 지원
 - 각주 `[1]`, `[2]` 셀 단일 클릭 시 toolTip 으로 본문 표시
 - 광고 컨테이너 자동 차단
 - 좌우 스크롤 차단 + 윈도우 폭 따라 자동 줄바꿈
-- 리본 좌상단 `◀` 또는 `Alt+←` / `Backspace` 로 뒤로 가기
+- 모든 시트 **첫 행 frozen** (스크롤 내려도 헤더/제목 고정)
+- **Sheet1 = 위장 시트** (주간 업무 진행 현황) — 사무실에서 일하는 척 할 때 `Ctrl+Z` 한 방으로 점프
 
 ## 빠른 실행 (Windows)
 
@@ -42,22 +43,38 @@ python main.py
 
 ## 사용법
 
-1. 실행 후 우상단 검색박스에 나무위키 문서 제목 입력 + Enter
+1. 실행하면 **Sheet1 (위장 시트)** 가 먼저 보임. 일하는 척 하기 좋은 빈 양식이 떠있음.
+2. 본격 사용하려면 우상단 검색박스에 나무위키 문서 제목 입력 + Enter
    - 예: `악어`, `리누스 토르발스`, `Qt`
    - 일반 URL (`https://...`) / 로컬 파일 경로도 그대로 입력 가능
-2. 약 5초 대기 후 페이지가 셀에 채워짐
-3. 셀 동작
-   - 파란 밑줄 셀 = 링크 → **더블클릭**해서 이동
-   - 회색 밑줄 `[N]` = 각주 → **단일클릭**해서 toolTip
-   - 📷 셀 = 이미지 → **더블클릭**해서 사진 팝업
+3. 자동으로 Sheet2 (작업 영역) 로 전환 + 페이지 로드 (약 5초)
+4. 셀 동작
+   - **파란 밑줄 셀** = 링크 → **더블클릭**해서 이동 / **우클릭 → 새 시트로 열기**
+   - **회색 밑줄 `[N]`** = 각주 → **단일클릭**해서 toolTip
+   - **📷 셀** = 이미지 → **더블클릭**해서 사진 팝업
+
+### 위장 모드 (사무실 생존)
+
+- **`Ctrl+Z`** 어떤 시트/화면에서든 즉시 **Sheet1 (위장 시트)** 으로 점프
+- 위장 시트의 헤더는 frozen 처리되어 스크롤해도 그대로 보임
+- 검색박스에 텍스트 치고 Enter 하면 자동으로 작업 시트(Sheet2~) 로 전환되며 위장 시트는 그대로 유지됨
 
 ## 단축키
 
 | 단축키 | 기능 |
 |---|---|
 | `Enter` (검색박스) | 페이지 로드 |
+| `Ctrl+Z` | Sheet1 (위장 시트) 로 즉시 점프 |
 | `Alt+←` / `Backspace` | 뒤로 가기 |
 | `Ctrl+D` | namu.wiki 원본 페이지를 별창에 표시 (디버그) |
+
+## 시트 구성
+
+| 시트 | 용도 |
+|---|---|
+| **Sheet1** | 위장 시트 (주간 업무 진행 현황 헤더 + 빈 양식). 시작 시 기본 표시 |
+| **Sheet2** | namu.wiki 작업 시트 — 첫 검색 시 자동 활성화 |
+| **Sheet3+** | 우클릭 → "새 시트로 열기" 또는 추가 검색 시 동적 생성 |
 
 ## 디렉토리 구조
 
@@ -65,15 +82,16 @@ python main.py
 ExcelView/
 ├── main.py                 # 엔트리
 ├── excelview/
-│   ├── mainwindow.py       # 메인 윈도우 조립
+│   ├── mainwindow.py       # 메인 윈도우 + 시트별 상태 관리
 │   ├── ribbonbar.py        # 엑셀 풍 리본 + 검색박스 + 뒤로 버튼
 │   ├── formulabar.py       # 이름박스 + fx + 수식 입력줄
-│   ├── sheetview.py        # 셀 그리드 (좌표 매핑, 링크/각주/이미지 처리)
-│   ├── sheettabbar.py      # Sheet1/2/3 탭
+│   ├── sheetview.py        # 셀 그리드 + frozen top row + 우클릭 메뉴
+│   ├── sheettabbar.py      # Sheet1/2/... 동적 탭
 │   ├── statusbar.py        # 그린 상태바 + 줌
 │   ├── namuloader.py       # QtWebEngine 으로 namu.wiki 로드 + 토큰 추출
-│   ├── namuformatter.py    # positioned tokens → 셀 매트릭스
-│   └── imagedialog.py      # 이미지 미리보기 다이얼로그
+│   ├── namuformatter.py    # positioned tokens → 셀 매트릭스 (단어/punctuation 처리)
+│   ├── imagedialog.py      # 이미지 미리보기 (520x400 고정)
+│   └── decoysheets.py      # 위장 시트 데이터
 ├── resources/excel.qss     # 엑셀 룩 스타일시트
 ├── ExcelView.spec          # PyInstaller 빌드 spec
 ├── requirements.txt        # 실행 의존성
