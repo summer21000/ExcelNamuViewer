@@ -1,6 +1,6 @@
 # ExcelNamuViewer (ExcelView)
 
-엑셀 룩으로 위장된 나무위키 뷰어. PySide6 + QtWebEngine 으로 구현.
+엑셀 처럼 위장된 나무위키 뷰어. PySide6 + QtWebEngine 으로 구현.
 
 - namu.wiki 페이지의 전체 시각 구조를 좌표 기반으로 엑셀 셀 그리드에 매핑
 - 이미지는 셀에 `📷 [사진 보기]` placeholder 로 표시 → 더블 클릭하면 별도 다이얼로그로 사진 표시
