@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import QMainWindow, QVBoxLayout, QWidget
 
+from excelview import decoystore
 from excelview.decoysheets import decoy_sheet2, decoy_sheet3
 from excelview.formulabar import FormulaBar
 from excelview.imagedialog import ImageDialog
@@ -191,8 +192,18 @@ class MainWindow(QMainWindow):
             self._refill_timer.start(200)
 
     # ------------------------------------------------------------------ sheet tabs
+    def _save_decoy_if_current(self) -> None:
+        """현재 시트가 위장 시트 (decoy2) 면 매트릭스 dump → 파일 저장."""
+        cur = self._sheets.get(self._current_sheet, {})
+        if cur.get("type") != "decoy2":
+            return
+        matrix = self.sheet.dumpMatrix(rows=80, cols=20)
+        decoystore.save(matrix)
+
     def _on_sheet_changed(self, idx: int) -> None:
         """sheet 전환 — 떠나는 시트 스크롤 저장, 도착 시트 스크롤 복원."""
+        # 떠나는 시트가 위장 시트면 편집 내용 저장
+        self._save_decoy_if_current()
         # 떠나는 시트의 스크롤 위치 저장
         prev = self._sheets.get(self._current_sheet)
         if prev is not None:
@@ -204,8 +215,10 @@ class MainWindow(QMainWindow):
         kind = info.get("type", "namu")
 
         if kind == "decoy2":
+            saved = decoystore.load()
+            data = saved if saved else decoy_sheet2()
             self.sheet.clearAll()
-            self.sheet.fillMatrix(decoy_sheet2(), start_row=0, start_col=0)
+            self.sheet.fillMatrix(data, start_row=0, start_col=0)
             self.status.setSummary("주간 업무 진행 현황")
         elif kind == "decoy3":
             self.sheet.clearAll()
@@ -394,6 +407,11 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ shutdown
     def closeEvent(self, e) -> None:
+        # 위장 시트 편집 내용 저장 (프로그램 다음 실행 시 유지)
+        try:
+            self._save_decoy_if_current()
+        except Exception:
+            pass
         try:
             self.loader.cleanup()
         except Exception:

@@ -129,6 +129,29 @@ class SheetView(QTableView):
     def clearAll(self) -> None:
         self._build_model(self._model.rowCount(), self._model.columnCount())
 
+    def dumpMatrix(self, rows: int, cols: int) -> list[list[tuple]]:
+        """모델의 (0..rows, 0..cols) 영역을 (text, bold) 매트릭스로 추출."""
+        out: list[list[tuple]] = []
+        for r in range(rows):
+            row: list[tuple] = []
+            empty_tail_start = -1
+            for c in range(cols):
+                item = self._model.item(r, c)
+                if item is None:
+                    row.append(("", False))
+                else:
+                    text = item.text() or ""
+                    bold = item.font().bold()
+                    row.append((text, bold))
+            # 행 끝의 빈 셀 trim
+            while row and row[-1][0] == "":
+                row.pop()
+            out.append(row)
+        # 매트릭스 끝의 빈 행 trim
+        while out and (not out[-1] or all(c[0] == "" for c in out[-1])):
+            out.pop()
+        return out
+
     @property
     def model_(self) -> QStandardItemModel:
         return self._model
@@ -190,7 +213,11 @@ class SheetView(QTableView):
         fv.setFocusPolicy(Qt.NoFocus)
         fv.setSelectionMode(QAbstractItemView.SingleSelection)
         fv.setSelectionBehavior(QAbstractItemView.SelectItems)
-        fv.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        fv.setEditTriggers(
+            QAbstractItemView.DoubleClicked
+            | QAbstractItemView.EditKeyPressed
+            | QAbstractItemView.AnyKeyPressed
+        )
         fv.setFrameShape(QFrame.NoFrame)
         fv.setShowGrid(True)
         fv.setGridStyle(Qt.SolidLine)
