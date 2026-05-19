@@ -103,6 +103,10 @@ class MainWindow(QMainWindow):
         panic = QShortcut(QKeySequence("Ctrl+Z"), self)
         panic.activated.connect(lambda: self.tabs.selectSheet(0))
 
+        # Ctrl+S — 위장 시트 저장 (명시)
+        save_sc = QShortcut(QKeySequence("Ctrl+S"), self)
+        save_sc.activated.connect(self._on_save_shortcut)
+
     # ------------------------------------------------------------------ search
     def _ensure_namu_sheet_active(self) -> None:
         """현재 시트가 위장(decoy) 이면 namu 시트로 전환. 없으면 새로 만듦."""
@@ -192,13 +196,35 @@ class MainWindow(QMainWindow):
             self._refill_timer.start(200)
 
     # ------------------------------------------------------------------ sheet tabs
-    def _save_decoy_if_current(self) -> None:
+    def _commit_active_editor(self) -> None:
+        """편집 중인 셀의 editor 를 강제 commit (편집 도중 저장 시 손실 방지)."""
+        try:
+            idx = self.sheet.currentIndex()
+            if idx.isValid():
+                w = self.sheet.indexWidget(idx)
+                if w is not None:
+                    self.sheet.commitData(w)
+        except Exception:
+            pass
+
+    def _save_decoy_if_current(self, verbose: bool = False) -> None:
         """현재 시트가 위장 시트 (decoy2) 면 매트릭스 dump → 파일 저장."""
         cur = self._sheets.get(self._current_sheet, {})
         if cur.get("type") != "decoy2":
+            if verbose:
+                self.status.setStatusText("저장은 Sheet1 (위장 시트) 에서만 동작합니다")
             return
+        self._commit_active_editor()
         matrix = self.sheet.dumpMatrix(rows=80, cols=20)
-        decoystore.save(matrix)
+        ok, info = decoystore.save(matrix)
+        if ok and verbose:
+            self.status.setStatusText(f"저장됨: {info}")
+        elif not ok:
+            self.status.setStatusText(f"저장 실패: {info}")
+
+    def _on_save_shortcut(self) -> None:
+        """Ctrl+S — 위장 시트 명시 저장."""
+        self._save_decoy_if_current(verbose=True)
 
     def _on_sheet_changed(self, idx: int) -> None:
         """sheet 전환 — 떠나는 시트 스크롤 저장, 도착 시트 스크롤 복원."""

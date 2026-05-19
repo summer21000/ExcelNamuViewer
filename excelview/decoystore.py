@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
-
-from PySide6.QtCore import QStandardPaths
 
 
 def _config_dir() -> Path:
-    base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
-    if not base:
-        base = str(Path.home() / ".excelview")
-    p = Path(base)
+    """프로그램과 같은 경로의 ExcelViewAPPDATA 폴더."""
+    if getattr(sys, "frozen", False):
+        # PyInstaller .exe — 실행 파일이 있는 폴더
+        base = Path(sys.executable).resolve().parent
+    else:
+        # 개발 모드 — main.py 가 있는 프로젝트 루트
+        base = Path(__file__).resolve().parent.parent
+    p = base / "ExcelViewAPPDATA"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -19,14 +22,15 @@ def _decoy_file() -> Path:
     return _config_dir() / "decoy_sheet1.json"
 
 
-def save(matrix: list[list[tuple]]) -> None:
-    """매트릭스를 JSON 으로 저장. tuple = (text, bold)."""
-    data = [[[t[0], bool(t[1]) if len(t) > 1 else False] for t in row] for row in matrix]
-    path = _decoy_file()
+def save(matrix: list[list[tuple]]) -> tuple[bool, str]:
+    """매트릭스를 JSON 으로 저장. (성공 여부, 경로 또는 에러 메시지) 반환."""
     try:
+        data = [[[t[0], bool(t[1]) if len(t) > 1 else False] for t in row] for row in matrix]
+        path = _decoy_file()
         path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+        return True, str(path)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def load() -> list[list[tuple]] | None:
