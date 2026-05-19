@@ -1,0 +1,31 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# --- venv ---
+.venv/
+venv/
+env/
+
+# --- PyInstaller ---
+build/
+dist/
+*.spec.bak
+
+# --- IDE ---
+.vscode/
+.idea/
+*.user
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- 로컬 캐시/임시 ---
+*.log
+*.tmp
+*.swp

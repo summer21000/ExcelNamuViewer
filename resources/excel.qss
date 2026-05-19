@@ -1,0 +1,281 @@
+/* ===========================================================
+   ExcelView — Microsoft Excel (Office 365) look-alike QSS
+   =========================================================== */
+
+QMainWindow, QWidget {
+    background: #f3f2f1;
+    color: #201f1e;
+    font-family: "Malgun Gothic", "Segoe UI", "Calibri";
+    font-size: 11px;
+}
+
+/* ===== Ribbon ===== */
+#RibbonBar {
+    background: #ffffff;
+    border-bottom: 1px solid #d1d1d1;
+}
+#RibbonTabBar {
+    background: #ffffff;
+}
+QToolButton#RibbonTab {
+    color: #444444;
+    background: transparent;
+    border: none;
+    padding: 0 14px;
+    font-size: 12px;
+}
+QToolButton#RibbonTab:hover {
+    background: #f3f2f1;
+}
+QToolButton#RibbonTab:checked {
+    color: #217346;
+    background: #ffffff;
+    border-bottom: 2px solid #217346;
+    font-weight: bold;
+}
+QToolButton#RibbonTabFile {
+    color: #ffffff;
+    background: #217346;
+    border: none;
+    padding: 0 16px;
+    font-size: 12px;
+    font-weight: bold;
+}
+QToolButton#RibbonTabFile:hover {
+    background: #185a37;
+}
+QLineEdit#RibbonSearch {
+    background: #f3f2f1;
+    border: 1px solid #d1d1d1;
+    border-radius: 2px;
+    padding: 2px 8px;
+    color: #444444;
+    selection-background-color: #217346;
+}
+QLineEdit#RibbonSearch:focus {
+    border: 1px solid #217346;
+    background: #ffffff;
+}
+
+#RibbonPages, #RibbonPage {
+    background: #ffffff;
+}
+#RibbonGroup {
+    background: #ffffff;
+}
+QLabel#RibbonGroupTitle {
+    color: #707070;
+    font-size: 10px;
+}
+QFrame#RibbonGroupSep {
+    color: #e1e1e1;
+    background: #e1e1e1;
+}
+
+QToolButton#RibbonBigBtn {
+    background: #ffffff;
+    border: 1px solid transparent;
+    color: #303030;
+    padding: 4px;
+}
+QToolButton#RibbonBigBtn:hover {
+    background: #e8f3ee;
+    border: 1px solid #c5e2d0;
+}
+QToolButton#RibbonBigBtn:pressed {
+    background: #c5e2d0;
+}
+
+QToolButton#RibbonSmallBtn {
+    background: #ffffff;
+    border: 1px solid transparent;
+    color: #303030;
+    padding: 2px 6px;
+    text-align: left;
+}
+QToolButton#RibbonSmallBtn:hover {
+    background: #e8f3ee;
+    border: 1px solid #c5e2d0;
+}
+QToolButton#RibbonSmallBtn:pressed {
+    background: #c5e2d0;
+}
+
+QComboBox {
+    background: #ffffff;
+    border: 1px solid #d1d1d1;
+    padding: 2px 4px;
+    color: #201f1e;
+}
+QComboBox:hover {
+    border: 1px solid #217346;
+}
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    color: #201f1e;
+    selection-background-color: #c5e2d0;
+    selection-color: #201f1e;
+    border: 1px solid #d1d1d1;
+}
+
+/* ===== FormulaBar ===== */
+#FormulaBar {
+    background: #ffffff;
+    border-bottom: 1px solid #d1d1d1;
+}
+QLineEdit#NameBox {
+    background: #ffffff;
+    border: 1px solid #d1d1d1;
+    color: #201f1e;
+    padding: 1px 6px;
+}
+QLineEdit#FormulaEdit {
+    background: #ffffff;
+    border: 1px solid #d1d1d1;
+    color: #201f1e;
+    padding: 1px 6px;
+    selection-background-color: #c5e2d0;
+}
+QFrame#FbSep {
+    background: #d1d1d1;
+    color: #d1d1d1;
+}
+QToolButton#FbCancel, QToolButton#FbCommit, QToolButton#FbFx {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #707070;
+}
+QToolButton#FbCancel:enabled { color: #c42b1c; }
+QToolButton#FbCommit:enabled { color: #217346; }
+QToolButton#FbCancel:hover, QToolButton#FbCommit:hover, QToolButton#FbFx:hover {
+    background: #e8f3ee;
+    border: 1px solid #c5e2d0;
+}
+
+/* ===== SheetView ===== */
+QTableView#SheetView {
+    background: #ffffff;
+    gridline-color: #d4d4d4;
+    color: #201f1e;
+    border: none;
+    selection-background-color: rgba(33, 115, 70, 30);
+    selection-color: #201f1e;
+}
+QTableView#SheetView::item {
+    padding: 0 3px;
+    border: none;
+}
+QTableView#SheetView::item:selected {
+    background: rgba(33, 115, 70, 30);
+    color: #201f1e;
+}
+
+/* 행/열 헤더 */
+QHeaderView#SheetHHeader::section,
+QHeaderView#SheetVHeader::section {
+    background: #f3f2f1;
+    color: #444444;
+    border: none;
+    border-right: 1px solid #d4d4d4;
+    border-bottom: 1px solid #d4d4d4;
+    padding: 0;
+}
+QHeaderView#SheetHHeader::section:checked,
+QHeaderView#SheetVHeader::section:checked {
+    background: #217346;
+    color: #ffffff;
+}
+QHeaderView::section:hover {
+    background: #e6e6e6;
+}
+
+/* 좌상단 corner */
+QTableCornerButton::section {
+    background: #f3f2f1;
+    border: none;
+    border-right: 1px solid #d4d4d4;
+    border-bottom: 1px solid #d4d4d4;
+}
+
+QScrollBar:horizontal, QScrollBar:vertical {
+    background: #f3f2f1;
+    border: none;
+}
+QScrollBar:horizontal { height: 14px; }
+QScrollBar:vertical   { width: 14px; }
+QScrollBar::handle:horizontal, QScrollBar::handle:vertical {
+    background: #c8c6c4;
+    border-radius: 2px;
+    min-width: 30px;
+    min-height: 30px;
+}
+QScrollBar::handle:hover { background: #a19f9d; }
+QScrollBar::add-line, QScrollBar::sub-line { background: none; border: none; }
+QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+
+/* ===== SheetTabBar ===== */
+#SheetTabBar {
+    background: #f3f2f1;
+    border-top: 1px solid #d1d1d1;
+}
+QToolButton#SheetTab {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #444444;
+    padding: 0 12px;
+}
+QToolButton#SheetTab:hover {
+    background: #e6e6e6;
+}
+QToolButton#SheetTab:checked {
+    background: #ffffff;
+    color: #217346;
+    font-weight: bold;
+    border: 1px solid #d1d1d1;
+    border-bottom: 2px solid #217346;
+}
+QToolButton#SheetNavBtn, QToolButton#SheetPlusBtn {
+    background: transparent;
+    border: none;
+    color: #444444;
+}
+QToolButton#SheetNavBtn:hover, QToolButton#SheetPlusBtn:hover {
+    background: #e6e6e6;
+}
+
+/* ===== ExcelStatusBar ===== */
+#ExcelStatusBar {
+    background: #217346;
+    color: #000000;
+    border-top: 1px solid #185a37;
+}
+#ExcelStatusBar QLabel {
+    color: #000000;
+    background: transparent;
+    font-weight: 600;
+}
+QToolButton#StatusViewBtn {
+    background: transparent;
+    border: none;
+    color: #000000;
+}
+QToolButton#StatusViewBtn:hover {
+    background: #185a37;
+    color: #ffffff;
+}
+QSlider#StatusZoom::groove:horizontal {
+    background: #185a37;
+    height: 4px;
+    border-radius: 2px;
+}
+QSlider#StatusZoom::handle:horizontal {
+    background: #ffffff;
+    width: 10px;
+    height: 10px;
+    margin: -4px 0;
+    border-radius: 5px;
+}
+QSlider#StatusZoom::sub-page:horizontal {
+    background: #ffffff;
+    border-radius: 2px;
+}
