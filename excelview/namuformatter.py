@@ -96,6 +96,21 @@ def _is_punct_only(v: str) -> bool:
     return all(ch in _PUNCT_GLUE for ch in s)
 
 
+def _dedup_images_in_row(row_tokens: list[dict]) -> list[dict]:
+    """같은 행 안에서 동일 src 이미지가 여러 번 잡히면 (thumb+full 등) 한 번만 남김."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for tok in row_tokens:
+        if tok.get("t") == "i":
+            src = (tok.get("src") or "").strip()
+            if src and src in seen:
+                continue
+            if src:
+                seen.add(src)
+        out.append(tok)
+    return out
+
+
 def _merge_inline(row_tokens: list[dict]) -> list[dict]:
     """같은 행 안에서 가까이 있는 텍스트 토큰들을 한 토큰으로 합친다.
 
@@ -175,6 +190,7 @@ def format_positioned(
                 rows_out.append([("", False, None, None, None)])
             continue
         empty_streak = 0
+        group = _dedup_images_in_row(group)
         merged = _merge_inline(group)
         row_cells: list[tuple] = []
         col = 0
@@ -207,7 +223,7 @@ def format_positioned(
             else:  # image
                 src = (tok.get("src") or "").strip()
                 alt = (tok.get("alt") or "").strip()
-                text = "📷 [사진 보기]" + (f" — {alt}" if alt else "")
+                text = "[사진보기]" + (f" — {alt}" if alt else "")
                 append_cell(text, src, href, fn)
 
         commit_row(row_cells)

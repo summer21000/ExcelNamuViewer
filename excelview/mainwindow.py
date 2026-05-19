@@ -70,6 +70,8 @@ class MainWindow(QMainWindow):
         self.sheet.linkOpenInNewSheet.connect(self._on_link_cell_new_sheet)
         self.sheet.visibleColsChanged.connect(self._on_visible_cols)
         self.tabs.sheetChanged.connect(self._on_sheet_changed)
+        self.tabs.newSheetRequested.connect(self._on_new_sheet)
+        self.tabs.closeSheetRequested.connect(self._on_close_sheet)
         self.formula.formulaCommitted.connect(self._on_formula_committed)
         self.status.zoomChanged.connect(self._on_zoom_changed)
 
@@ -190,32 +192,84 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ sheet tabs
     def _on_sheet_changed(self, idx: int) -> None:
-        """sheet 인덱스별 데이터 표시. namu 타입은 저장된 tokens 로 재렌더."""
+        """sheet 전환 — 떠나는 시트 스크롤 저장, 도착 시트 스크롤 복원."""
+        # 떠나는 시트의 스크롤 위치 저장
+        prev = self._sheets.get(self._current_sheet)
+        if prev is not None:
+            prev["scroll_v"] = self.sheet.verticalScrollBar().value()
+            prev["scroll_h"] = self.sheet.horizontalScrollBar().value()
+
         self._current_sheet = idx
         info = self._sheets.get(idx, {"type": "namu"})
         kind = info.get("type", "namu")
+
         if kind == "decoy2":
             self.sheet.clearAll()
             self.sheet.fillMatrix(decoy_sheet2(), start_row=0, start_col=0)
             self.status.setSummary("주간 업무 진행 현황")
-            return
-        if kind == "decoy3":
+        elif kind == "decoy3":
             self.sheet.clearAll()
             self.sheet.fillMatrix(decoy_sheet3(), start_row=0, start_col=0)
             self.status.setSummary("자재 입출고 내역")
-            return
-        # namu 시트
-        self._last_title = info.get("title", "")
-        self._last_tokens = info.get("tokens", [])
-        self._last_url = info.get("url", "")
-        self._last_page_w = info.get("page_w", 1280)
-        if self._last_tokens:
-            self._refill()
-            self.ribbon.search_edit.setText(self._last_title)
         else:
-            self.sheet.clearAll()
-            self.status.setSummary(f"{self.tabs.sheetName(idx)} (비어 있음)")
+            # namu 시트
+            self._last_title = info.get("title", "")
+            self._last_tokens = info.get("tokens", [])
+            self._last_url = info.get("url", "")
+            self._last_page_w = info.get("page_w", 1280)
+            if self._last_tokens:
+                self._refill()
+                self.ribbon.search_edit.setText(self._last_title)
+            else:
+                self.sheet.clearAll()
+                self.status.setSummary(f"{self.tabs.sheetName(idx)} (비어 있음)")
+
+        # 도착 시트의 저장된 스크롤 복원 — fillMatrix 끝난 뒤
+        sv = info.get("scroll_v", 0)
+        sh = info.get("scroll_h", 0)
+        self.sheet.verticalScrollBar().setValue(sv)
+        self.sheet.horizontalScrollBar().setValue(sh)
         self._update_window_title()
+
+    def _on_new_sheet(self) -> None:
+        """+ 버튼 → 빈 namu 작업 시트 추가."""
+        new_idx = self.tabs.addSheet()
+        self._sheets[new_idx] = {
+            "type": "namu", "tokens": [], "title": "",
+            "url": "", "page_w": 1280,
+        }
+        self.tabs.selectSheet(new_idx)
+
+    def _on_close_sheet(self, idx: int) -> None:
+        """우클릭 → 시트 닫기. Sheet1 (idx 0) 은 차단."""
+        if idx <= 0 or idx >= self.tabs.sheetCount():
+            return
+
+        # 1) TabBar 에서 위젯 제거
+        self.tabs.closeSheet(idx)
+
+        # 2) _sheets dict reindex — idx 이후 키를 -1 씩 이동
+        new_sheets: dict[int, dict] = {}
+        for k, v in self._sheets.items():
+            if k == idx:
+                continue
+            new_sheets[k if k < idx else k - 1] = v
+        self._sheets = new_sheets
+
+        # 3) pending 갱신
+        if self._pending_new_sheet is not None:
+            if self._pending_new_sheet == idx:
+                self._pending_new_sheet = None
+            elif self._pending_new_sheet > idx:
+                self._pending_new_sheet -= 1
+
+        # 4) current_sheet 갱신 / 활성 탭 전환
+        if self._current_sheet == idx:
+            new_active = max(0, idx - 1)
+            self._current_sheet = new_active
+            self.tabs.selectSheet(new_active)
+        elif self._current_sheet > idx:
+            self._current_sheet -= 1
 
     def _on_link_cell_new_sheet(self, href: str) -> None:
         """우클릭 → '새 시트로 열기'. 새 sheet 탭 만들고 거기에 로드."""
