@@ -2,6 +2,19 @@
 
 엑셀 처럼 위장된 나무위키 뷰어. PySide6 + QtWebEngine 으로 구현.
 
+---
+
+## ⬇️ 바로 다운로드 (빌드 불필요)
+
+> **소스 빌드 / Python 설치 없이 즉시 사용할 수 있습니다.**
+>
+> 👉 **[GitHub Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest)** 에서 최신 `ExcelView.exe` (≈245 MB) 를 다운로드 → **더블클릭만 하면 실행**
+>
+> - Windows 10 / 11 (64bit) 에서 바로 동작
+> - Python, pip, git clone 모두 불필요 — 단일 실행 파일
+
+---
+
 - namu.wiki 페이지의 전체 시각 구조를 좌표 기반으로 엑셀 셀 그리드에 매핑
 - 이미지는 셀에 `📷 [사진 보기]` placeholder 로 표시 → 더블 클릭 시 별창에 사진 표시
 - 인라인 링크 더블 클릭으로 이동 + 우클릭 → "새 시트로 열기" 지원
@@ -42,6 +55,8 @@ python main.py
 다른 PC 에서도 그 .exe 하나만 더블클릭하면 동작 (Windows 10/11 x64).
 
 ## 사용법
+
+> 💡 **빌드 없이 즉시 쓰고 싶다면** → [Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest) 에서 `ExcelView.exe` 다운로드 → 더블클릭.
 
 1. 실행하면 **Sheet1 (위장 시트)** 가 먼저 보임. 일하는 척 하기 좋은 빈 양식이 떠있음.
 2. 본격 사용하려면 우상단 검색박스에 나무위키 문서 제목 입력 + Enter
