@@ -29,6 +29,7 @@ def cell_address(row: int, col: int) -> str:
 
 class SheetView(QTableView):
     cellSelected = Signal(int, int, str, str)
+    cellEdited = Signal()                    # 셀 편집 (모델 itemChanged) — clearAll 후에도 살아남음
     imageCellActivated = Signal(str, str)   # url, alt_or_label
     linkCellActivated = Signal(str)         # href — 같은 시트에서 열기 (더블클릭 / 메뉴 "열기")
     linkOpenInNewSheet = Signal(str)        # href — 새 시트에서 열기
@@ -196,6 +197,7 @@ class SheetView(QTableView):
         self._model = QStandardItemModel(rows, cols, self)
         self._model.setHorizontalHeaderLabels([column_letter(c) for c in range(cols)])
         self._model.setVerticalHeaderLabels([str(r + 1) for r in range(rows)])
+        self._model.itemChanged.connect(lambda _it: self.cellEdited.emit())
         self.setModel(self._model)
         self.selectionModel().currentChanged.connect(self._on_current_changed)
         self.selectionModel().setCurrentIndex(

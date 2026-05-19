@@ -12,6 +12,8 @@
 >
 > - Windows 10 / 11 (64bit) 에서 바로 동작
 > - Python, pip, git clone 모두 불필요 — 단일 실행 파일
+>
+> ⏳ **첫 실행은 10~20초 정도 화면이 안 뜰 수 있습니다.** `--onefile` 압축 해제 + Qt WebEngine 초기화에 시간이 걸립니다. 두 번째 실행부터는 빠릅니다.
 
 ---
 
@@ -35,6 +37,8 @@ run.bat
 처음 실행 시 자동으로 `.venv` 생성 + PySide6 설치 (약 250MB, 1회).
 이후엔 즉시 실행됨.
 
+> ⏳ **시작 시 PySide6 / Qt WebEngine 로드에 5~15초 정도 걸립니다.** 창이 바로 안 뜨더라도 잠깐 기다려주세요.
+
 ## 수동 실행
 
 ```cmd
@@ -54,9 +58,12 @@ python main.py
 → `dist\ExcelView.exe` (약 245MB, self-contained).
 다른 PC 에서도 그 .exe 하나만 더블클릭하면 동작 (Windows 10/11 x64).
 
+> ⏳ 빌드된 `.exe` 의 **첫 실행은 10~20초** 정도 걸립니다 (`--onefile` 압축 해제 + Qt WebEngine 초기화). 두 번째 실행부터는 빨라집니다.
+
 ## 사용법
 
 > 💡 **빌드 없이 즉시 쓰고 싶다면** → [Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest) 에서 `ExcelView.exe` 다운로드 → 더블클릭.
+> ⏳ 첫 실행은 압축 해제 + Qt WebEngine 초기화로 **10~20초** 정도 검은 화면일 수 있습니다.
 
 1. 실행하면 **Sheet1 (위장 시트)** 가 먼저 보임. 일하는 척 하기 좋은 빈 양식이 떠있음.
 2. 본격 사용하려면 우상단 검색박스에 나무위키 문서 제목 입력 + Enter

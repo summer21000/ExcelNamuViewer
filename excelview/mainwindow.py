@@ -83,7 +83,10 @@ class MainWindow(QMainWindow):
         }
         self._current_sheet = 0
         self._pending_new_sheet: int | None = None
+        self._decoy_dirty = False  # 사용자 편집 후만 True — 빈 모델로 저장 덮어쓰는 사고 방지
         self.sheet.setFrozenTopRow(True)
+        # 셀 편집 추적 — sheet 자체 signal 이라 clearAll 후에도 살아남음
+        self.sheet.cellEdited.connect(self._on_decoy_item_changed)
         # 시작 시 Sheet1 (위장) 표시
         self._on_sheet_changed(0)
 
@@ -208,19 +211,32 @@ class MainWindow(QMainWindow):
             pass
 
     def _save_decoy_if_current(self, verbose: bool = False) -> None:
-        """현재 시트가 위장 시트 (decoy2) 면 매트릭스 dump → 파일 저장."""
+        """현재 시트가 위장 시트 (decoy2) 면 매트릭스 dump → 파일 저장.
+
+        verbose=False (자동 저장) 일 땐 dirty 플래그 있을 때만 저장.
+        verbose=True (Ctrl+S) 는 dirty 무시하고 강제 저장.
+        """
         cur = self._sheets.get(self._current_sheet, {})
         if cur.get("type") != "decoy2":
             if verbose:
                 self.status.setStatusText("저장은 Sheet1 (위장 시트) 에서만 동작합니다")
             return
+        if not verbose and not self._decoy_dirty:
+            return  # 사용자 편집 없음 → 빈 모델로 덮어쓰지 않음
         self._commit_active_editor()
         matrix = self.sheet.dumpMatrix(rows=80, cols=20)
         ok, info = decoystore.save(matrix)
-        if ok and verbose:
-            self.status.setStatusText(f"저장됨: {info}")
-        elif not ok:
+        if ok:
+            self._decoy_dirty = False
+            if verbose:
+                self.status.setStatusText(f"저장됨: {info}")
+        else:
             self.status.setStatusText(f"저장 실패: {info}")
+
+    def _on_decoy_item_changed(self) -> None:
+        """sheet.cellEdited 시 dirty 플래그 set."""
+        if self._sheets.get(self._current_sheet, {}).get("type") == "decoy2":
+            self._decoy_dirty = True
 
     def _on_save_shortcut(self) -> None:
         """Ctrl+S — 위장 시트 명시 저장."""
@@ -245,6 +261,7 @@ class MainWindow(QMainWindow):
             data = saved if saved else decoy_sheet2()
             self.sheet.clearAll()
             self.sheet.fillMatrix(data, start_row=0, start_col=0)
+            self._decoy_dirty = False  # 로드 직후 — 빈 모델 사고 방지
             self.status.setSummary("주간 업무 진행 현황")
         elif kind == "decoy3":
             self.sheet.clearAll()
