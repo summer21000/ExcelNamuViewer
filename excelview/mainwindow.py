@@ -83,6 +83,9 @@ class MainWindow(QMainWindow):
         }
         self._current_sheet = 0
         self._pending_new_sheet: int | None = None
+        # 로드를 시작한 namu 시트 — 비동기 추출 도중 다른 시트(위장 포함)로
+        # 이동해도 결과는 항상 이 시트에 들어간다.
+        self._loading_sheet: int | None = None
         self._decoy_dirty = False  # 사용자 편집 후만 True — 빈 모델로 저장 덮어쓰는 사고 방지
         self.sheet.setFrozenTopRow(True)
         # 셀 편집 추적 — sheet 자체 signal 이라 clearAll 후에도 살아남음
@@ -131,6 +134,9 @@ class MainWindow(QMainWindow):
         # 새 시트로 열기 진행 중이 아니라면 namu 시트가 활성 상태여야
         if self._pending_new_sheet is None:
             self._ensure_namu_sheet_active()
+            # 로드를 시작한 시트를 고정 — 추출 완료 시 현재 시트가 아니라
+            # 이 시트가 결과를 받는다 (다른 시트로 이동해도 / 위장으로 숨어도).
+            self._loading_sheet = self._current_sheet
         self.status.setStatusText(f"'{title}' 로드 중...")
         self.status.setSummary("")
         self.loader.fetch(title)
@@ -163,13 +169,19 @@ class MainWindow(QMainWindow):
             self.tabs.selectSheet(target)
             return
 
-        # 현재 시트가 namu 타입이면 그것에 저장. 아니면 sheet0 에 저장 (기본 namu 시트)
-        target = self._current_sheet if self._sheets.get(self._current_sheet, {}).get("type") == "namu" else 0
+        # 로드를 시작한 시트(= 브라우저 탭)에 저장 — 도중 다른 시트로 이동했어도
+        # 그 시트가 받는다. 시작 시트가 닫혔으면(로딩 중 탭 닫기 = 취소) 결과 폐기.
+        target = self._loading_sheet
+        self._loading_sheet = None
+        if target is None or self._sheets.get(target, {}).get("type") != "namu":
+            self.status.setStatusText("준비")
+            return
         self._sheets[target] = {
             "type": "namu", "tokens": tokens, "title": title,
             "url": url, "page_w": page_w,
         }
-        # 현재 시트가 그 target 이면 화면 갱신
+        # 현재 보고 있는 시트가 target 일 때만 화면 갱신. 아니면 조용히 저장만 —
+        # 사용자가 이동한 시트/위장 시트를 함부로 전환하지 않는다(위장 보호).
         if self._current_sheet == target:
             self._last_title = title
             self._last_tokens = tokens
@@ -177,7 +189,8 @@ class MainWindow(QMainWindow):
             self._last_page_w = page_w
             self._refill()
         else:
-            self.tabs.selectSheet(target)
+            # 백그라운드 시트에 저장 완료 — "로드 중…" 상태 문구만 정리.
+            self.status.setStatusText("준비")
 
     def _refill(self) -> None:
         if not self._last_tokens:
@@ -194,8 +207,9 @@ class MainWindow(QMainWindow):
         self.status.setSummary(f"{len(rows)}행 (cols={max_cols}) · 사진 {n_img}장")
 
     def _on_visible_cols(self, _cols: int) -> None:
-        # resize debounce — 200ms 동안 추가 resize 없으면 재포맷
-        if self._current_sheet == 0 and self._last_tokens:
+        # resize debounce — 200ms 동안 추가 resize 없으면 재포맷.
+        # namu 시트를 볼 때만 재줄바꿈 (위장 시트는 _last_tokens 로 덮어쓰면 안 됨).
+        if self._sheets.get(self._current_sheet, {}).get("type") == "namu" and self._last_tokens:
             self._refill_timer.start(200)
 
     # ------------------------------------------------------------------ sheet tabs
@@ -312,12 +326,17 @@ class MainWindow(QMainWindow):
             new_sheets[k if k < idx else k - 1] = v
         self._sheets = new_sheets
 
-        # 3) pending 갱신
+        # 3) pending / loading 인덱스 갱신
         if self._pending_new_sheet is not None:
             if self._pending_new_sheet == idx:
                 self._pending_new_sheet = None
             elif self._pending_new_sheet > idx:
                 self._pending_new_sheet -= 1
+        if self._loading_sheet is not None:
+            if self._loading_sheet == idx:
+                self._loading_sheet = None  # 시작 시트가 닫힘 → fallback 처리됨
+            elif self._loading_sheet > idx:
+                self._loading_sheet -= 1
 
         # 4) current_sheet 갱신 / 활성 탭 전환
         if self._current_sheet == idx:
