@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QItemSelectionModel, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QKeyEvent, QStandardItem, QStandardItemModel
+from PySide6.QtCore import QEvent, QItemSelectionModel, Qt, Signal
+from PySide6.QtGui import (
+    QBrush, QColor, QFont, QFontMetricsF, QKeyEvent, QStandardItem, QStandardItemModel,
+)
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFrame, QHeaderView, QMenu, QTableView, QToolTip, QWidget,
+    QAbstractItemView, QFrame, QHeaderView, QMenu, QStyle, QTableView, QToolTip, QWidget,
 )
 
 
@@ -12,6 +14,9 @@ from PySide6.QtWidgets import (
 IMAGE_URL_ROLE = Qt.UserRole + 1
 LINK_URL_ROLE = Qt.UserRole + 2
 FOOTNOTE_ROLE = Qt.UserRole + 3
+
+# 나무위키 시트 글꼴 — 페이지도 이 글꼴로 렌더링해서 글자 폭을 맞춤
+DOC_FONT_FAMILY = "Malgun Gothic"
 
 
 def column_letter(col: int) -> str:
@@ -40,6 +45,7 @@ class SheetView(QTableView):
         self.setObjectName("SheetView")
         self._frozen: QTableView | None = None
         self._frozen_enabled = False
+        self._metrics_cache: dict[tuple[int, bool], QFontMetricsF] = {}
         self._build_appearance()
         self._build_model(2000, 60)
         self._build_frozen_view()
@@ -66,6 +72,8 @@ class SheetView(QTableView):
         image_url: str | None = None,
         link_url: str | None = None,
         footnote: str | None = None,
+        italic: bool = False,
+        strike: bool = False,
     ) -> None:
         item = self._model.item(row, col)
         if item is None:
@@ -73,10 +81,30 @@ class SheetView(QTableView):
             self._model.setItem(row, col, item)
         else:
             item.setText(value)
+        self._style_item(item, bold=bold, image_url=image_url, link_url=link_url,
+                         footnote=footnote, italic=italic, strike=strike)
 
-        if bold:
+    @staticmethod
+    def _style_item(
+        item: QStandardItem,
+        *,
+        bold: bool = False,
+        image_url: str | None = None,
+        link_url: str | None = None,
+        footnote: str | None = None,
+        italic: bool = False,
+        strike: bool = False,
+        base_font: QFont | None = None,
+    ) -> None:
+        """base_font: 글꼴을 바꾸는 셀(굵게/밑줄 등)의 기준 글꼴 — 시트 글꼴(배율 반영)을 주면
+        배율을 바꿨을 때 다른 셀과 같이 커지고 작아진다."""
+        if base_font is not None and (bold or italic or strike or image_url or link_url):
+            item.setFont(QFont(base_font))
+        if bold or italic or strike:
             f = item.font()
-            f.setBold(True)
+            f.setBold(bool(bold))
+            f.setItalic(bool(italic))
+            f.setStrikeOut(bool(strike))
             item.setFont(f)
 
         if image_url:
@@ -129,6 +157,59 @@ class SheetView(QTableView):
 
     def clearAll(self) -> None:
         self._build_model(self._model.rowCount(), self._model.columnCount())
+
+    def applyLayout(self, lay) -> None:
+        """namuformatter.SheetLayout 을 채운다 — 셀마다 글자 한 조각 (모든 셀 같은 너비)."""
+        rows = max(2000, lay.n_rows + 50)
+        cols = max(60, lay.n_cols)
+
+        base_font = QFont(self.font())
+        base_font.setFamily(DOC_FONT_FAMILY)
+
+        def fill(model: QStandardItemModel) -> None:
+            for c in lay.cells:
+                item = QStandardItem(c.text)
+                self._style_item(item, bold=c.bold, image_url=c.image, link_url=c.link,
+                                 footnote=c.footnote, italic=c.italic, strike=c.strike,
+                                 base_font=base_font)
+                item.setEditable(False)
+                model.setItem(c.row, c.col, item)
+
+        self._build_model(rows, cols, fill)
+
+    def contentWidth(self) -> int:
+        """세로 스크롤바가 생겨도 넘치지 않는, 셀 영역의 가용 폭(px)."""
+        sb = self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+        w = self.width() - self.verticalHeader().width() - 2 * self.frameWidth() - sb
+        return max(100, w)
+
+    def columnPixelWidth(self) -> int:
+        """기본 열(셀) 너비 — 모든 시트 공통, 배율로만 바뀜."""
+        return self.horizontalHeader().defaultSectionSize()
+
+    def basePixelSize(self) -> int:
+        f = self.font()
+        if f.pixelSize() > 0:
+            return f.pixelSize()
+        return max(8, round(f.pointSizeF() * self.logicalDpiY() / 72))
+
+    def measureText(self, text: str, px: int, bold: bool) -> float:
+        """셀 글꼴(맑은 고딕, px 크기)로 그렸을 때의 글자 폭."""
+        key = (int(px), bool(bold))
+        fm = self._metrics_cache.get(key)
+        if fm is None:
+            f = QFont(self.font())
+            f.setFamily(DOC_FONT_FAMILY)
+            f.setPixelSize(max(1, int(px)))
+            f.setBold(bool(bold))
+            fm = QFontMetricsF(f)
+            self._metrics_cache[key] = fm
+        return fm.horizontalAdvance(text)
+
+    def changeEvent(self, e) -> None:
+        if e.type() == QEvent.FontChange:
+            self._metrics_cache.clear()
+        super().changeEvent(e)
 
     def dumpMatrix(self, rows: int, cols: int) -> list[list[tuple]]:
         """모델의 (0..rows, 0..cols) 영역을 (text, bold) 매트릭스로 추출."""
@@ -193,11 +274,18 @@ class SheetView(QTableView):
         self.horizontalScrollBar().setSingleStep(20)
         self.verticalScrollBar().setSingleStep(20)
 
-    def _build_model(self, rows: int, cols: int) -> None:
-        self._model = QStandardItemModel(rows, cols, self)
-        self._model.setHorizontalHeaderLabels([column_letter(c) for c in range(cols)])
-        self._model.setVerticalHeaderLabels([str(r + 1) for r in range(rows)])
-        self._model.itemChanged.connect(lambda _it: self.cellEdited.emit())
+    def _build_model(self, rows: int, cols: int, fill=None) -> None:
+        model = QStandardItemModel(rows, cols, self)
+        model.setHorizontalHeaderLabels([column_letter(c) for c in range(cols)])
+        model.setVerticalHeaderLabels([str(r + 1) for r in range(rows)])
+        if fill is not None:
+            # 뷰에 붙이기 전에 채운다 — 붙은 모델에 setItem 하면 셀마다 뷰가 갱신돼 수 배 느림
+            fill(model)
+        model.itemChanged.connect(lambda _it: self.cellEdited.emit())
+        old_model = getattr(self, "_model", None)
+        old_sel = self.selectionModel()
+        old_frozen_sel = self._frozen.selectionModel() if self._frozen is not None else None
+        self._model = model
         self.setModel(self._model)
         self.selectionModel().currentChanged.connect(self._on_current_changed)
         self.selectionModel().setCurrentIndex(
@@ -207,6 +295,10 @@ class SheetView(QTableView):
         if self._frozen is not None:
             self._frozen.setModel(self._model)
             self._update_frozen_geometry()
+        # 이전 모델/선택 모델 정리 (setModel 은 이전 것을 지우지 않음)
+        for old in (old_sel, old_frozen_sel, old_model):
+            if old is not None:
+                old.deleteLater()
 
     # ------------------------------------------------------------------ frozen pane
     def _build_frozen_view(self) -> None:

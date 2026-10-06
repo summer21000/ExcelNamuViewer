@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
@@ -15,28 +15,22 @@ _UA_CHROME = (
 )
 
 
-# 각 텍스트/이미지 노드의 화면 좌표를 같이 수집한다.
-# 그래야 페이지의 시각적 구조 (좌측 사이드바/본문/우측 등) 를 셀 그리드로 매핑할 수 있다.
+# 본문 영역의 각 텍스트/이미지 조각의 화면 좌표 + 블록/서식(굵게 등) 정보를 수집한다.
+# 텍스트는 "화면상의 한 줄" 단위로 쪼갠다 — 여러 줄로 감긴 문단도 줄마다 정확한 위치를 가짐.
+# 그래야 본문의 구조 (줄 순서, 들여쓰기, 표의 열, 정보상자 위치) 를 셀 그리드로 옮길 수 있다.
 _EXTRACT_JS = r"""
 JSON.stringify((function() {
   var SKIP = {
-    SCRIPT:1, STYLE:1, NOSCRIPT:1,
+    SCRIPT:1, STYLE:1, NOSCRIPT:1, TEMPLATE:1,
     SVG:1, svg:1, PATH:1, path:1,
     IFRAME:1, LINK:1, META:1,
+    INPUT:1, TEXTAREA:1, SELECT:1,
     INS:1   // AdSense 등 광고 ins 태그
   };
 
-  function isHidden(el) {
-    try {
-      var s = window.getComputedStyle(el);
-      if (s.display === 'none' || s.visibility === 'hidden') return true;
-    } catch (e) {}
-    return false;
-  }
-
   // id / class 에 광고성 키워드가 들어간 컨테이너 검출.
   // 단어 경계(\b)로 false positive (address, headline 등) 회피.
-  var AD_RE = /(^|[\s_-])(ad|ads|adv|advert|adunit|adsense|adsbygoogle|sponsor|sponsored|promo|partnerpixel)([\s_-]|$)/i;
+  var AD_RE = /(^|[\s_-])(ad|ads|gad|adv|advert|adunit|adsense|adsbygoogle|sponsor|sponsored|promo|partnerpixel)([\s_-]|$)/i;
   function isAd(el) {
     var id = el.id || '';
     var cls = el.className;
@@ -48,12 +42,82 @@ JSON.stringify((function() {
     return false;
   }
 
-  var tokens = [];
+  // 페이지를 시트와 같은 글꼴(맑은 고딕)로 다시 배치 — 브라우저가 계산한 줄바꿈 위치와
+  // 글자 폭이 셀에 그릴 때와 같아져서, 셀 글자가 축소/잘림 없이 그대로 들어간다.
+  try {
+    if (!document.getElementById('__excelview_font')) {
+      var fst = document.createElement('style');
+      fst.id = '__excelview_font';
+      fst.textContent = '*{font-family:"Malgun Gothic","맑은 고딕",sans-serif !important;}';
+      (document.head || document.documentElement).appendChild(fst);
+    }
+  } catch (e) {}
+
+  var sx = window.scrollX, sy = window.scrollY;
+  var pageW = document.documentElement.scrollWidth;
+  var pageH = document.documentElement.scrollHeight;
+
+  // tokens: 문서(DOM) 순서 = 읽는 순서. 텍스트는 "화면상의 한 줄" 단위로 쪼개서 넣는다.
+  // b(블록 번호): 블록 요소마다 새 번호 — 같은 블록 안의 조각만 서로 합칠 수 있다.
+  // styles: 셀 서식으로 옮길 것만 (굵게/기울임/취소선). 글자 크기·색·배경은 옮기지 않는다
+  //         — 엑셀처럼 보이는 것이 우선.
+  var tokens = [], styles = [], styleIdx = {}, nBlocks = 0;
   var range = document.createRange();
+
+  function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+
+  function styleOf(s, ctx) {
+    var fw = parseInt(s.fontWeight, 10) || 400;
+    var key = (fw >= 600 ? 1 : 0) + '|' + (s.fontStyle === 'italic' ? 1 : 0) + '|' + (ctx.strike ? 1 : 0);
+    if (!(key in styleIdx)) {
+      var a = key.split('|');
+      styleIdx[key] = styles.length;
+      styles.push({b: +a[0], i: +a[1], s: +a[2]});
+    }
+    return styleIdx[key];
+  }
+
+  // 본문 영역만 — 상단 메뉴바 / 우측 사이드바(최근 변경·인기 검색어·광고) 제외.
+  // 문서 제목(h1)과 첫 문단 제목(#s-1)을 함께 품는 가장 가까운 요소가 본문 열이다.
+  function contentRoot() {
+    var body = document.body;
+    var h1 = document.querySelector('h1');
+    if (!h1) return body;
+    var root = null;
+    var sec = document.querySelector('[id^="s-"]');
+    if (sec) {
+      var seen = new Set();
+      for (var a = h1; a; a = a.parentElement) seen.add(a);
+      for (var b = sec; b; b = b.parentElement) { if (seen.has(b)) { root = b; break; } }
+    }
+    if (!root) {
+      // 문단 제목이 없는 짧은 문서 — 사이드바와 나란히 놓인 열까지만 올라간다
+      root = h1;
+      while (root.parentElement && root.parentElement !== body &&
+             root.parentElement.getBoundingClientRect().width <= pageW * 0.75) {
+        root = root.parentElement;
+      }
+    }
+    // 본문 글자가 너무 적게 잡히면 판별 실패로 보고 전체 페이지
+    var bodyLen = (body.innerText || '').length;
+    if (!root || root === body || (root.innerText || '').length < bodyLen * 0.3) return body;
+    return root;
+  }
+
+  function inter(a, b) {
+    if (!a) return b;
+    return {l: Math.max(a.l, b.l), t: Math.max(a.t, b.t),
+            r: Math.min(a.r, b.r), b: Math.min(a.b, b.b)};
+  }
+  // overflow:hidden 등으로 잘려 화면에 안 보이는 조각은 버린다.
+  function visibleIn(clip, r) {
+    if (!clip) return true;
+    var cx = r.left + sx + r.width / 2, cy = r.top + sy + r.height / 2;
+    return cx >= clip.l - 1 && cx <= clip.r + 1 && cy >= clip.t - 1 && cy <= clip.b + 1;
+  }
 
   // 각주 anchor: href 가 in-page #anchor 이면 그 target 또는 부모 컨테이너의 텍스트 추출.
   // namu.wiki 는 <span id="fn-N"></span> 빈 anchor + 부모 span 에 각주 본문 텍스트.
-  // rfn-N / fn-N 도 비슷한 패턴 → 부모 1~3 단계 올라가며 짧은 본문 찾기.
   function resolveFootnote(href) {
     if (!href) return null;
     var hashIdx = href.indexOf('#');
@@ -69,38 +133,113 @@ JSON.stringify((function() {
     var cur = target.parentElement;
     for (var i = 0; i < 4 && cur; i++) {
       var t = (cur.innerText || '').replace(/\s+/g, ' ').trim();
-      // 너무 큰 컨테이너(섹션 전체) 는 각주 본문이 아님
-      if (t.length >= 3 && t.length <= 2000) {
-        return t.substring(0, 600);
-      }
+      if (t.length >= 3 && t.length <= 2000) return t.substring(0, 600);
       cur = cur.parentElement;
     }
     return null;
   }
 
-  function pushText(node, href, fn) {
-    var t = (node.nodeValue || '').replace(/\s+/g, ' ').trim();
-    if (!t) return;
-    try { range.selectNodeContents(node); }
-    catch (e) { return; }
-    var rects = range.getClientRects();
-    if (!rects || rects.length === 0) return;
-    var r = rects[0];
-    if (!r || (r.width === 0 && r.height === 0)) return;
+  function rectsOf(node, a, b) {
+    range.setStart(node, a);
+    range.setEnd(node, b);
+    var out = [];
+    var rs = range.getClientRects();
+    for (var i = 0; i < rs.length; i++) {
+      if (rs[i].width > 0.5 && rs[i].height > 0.5) out.push(rs[i]);
+    }
+    return out;
+  }
+
+  function emitText(text, r, ctx, ls, ts) {
+    // 아이콘 글꼴 문자(사용자 정의 영역)는 맑은 고딕에 없어서 빈 네모로 보이므로 뺀다
+    text = (text || '').replace(/[\uE000-\uF8FF]/g, '').trim();
+    if (!text || !visibleIn(ctx.clip, r)) return;
     var tok = {
-      t: 'x', v: t,
-      x: Math.round(r.left + window.scrollX),
-      y: Math.round(r.top + window.scrollY),
-      w: Math.round(r.width),
-      h: Math.round(r.height)
+      t: 'x', v: text,
+      x: Math.round(r.left + sx), y: Math.round(r.top + sy),
+      w: Math.round(r.width), h: Math.round(r.height),
+      b: ctx.blk, s: ctx.st
     };
-    if (fn) tok.fn = fn;
-    else if (href) tok.href = href;
+    if (ls) tok.ls = 1;
+    if (ts) tok.ts = 1;
+    if (ctx.fn) tok.fn = ctx.fn;
+    else if (ctx.href) tok.href = ctx.href;
     tokens.push(tok);
   }
 
+  function sameLine(a, r) {
+    var h = Math.min(a.bottom - a.top, r.height);
+    return Math.abs(r.top - a.top) < h * 0.5 && r.left >= a.right - 2;
+  }
+
+  // 텍스트 노드 하나를 "화면상의 줄" 단위 조각으로 분해.
+  // 한 줄에 다 들어가면 그대로, 여러 줄로 감기면 단어(필요하면 글자) 단위로 위치를 재서
+  // 같은 줄끼리 다시 묶는다 — 줄마다 정확한 x/y 를 가지므로 행 순서가 뒤섞이지 않는다.
+  function pushText(node, ctx) {
+    var raw = node.nodeValue;
+    if (!raw || !/\S/.test(raw)) return;
+    var ls = /^\s/.test(raw), ts = /\s$/.test(raw);
+    var all = rectsOf(node, 0, raw.length);
+    if (all.length === 0) return;
+    if (all.length === 1) {
+      emitText(raw.replace(/\s+/g, ' ').trim(), all[0], ctx, ls, ts);
+      return;
+    }
+    var line = null, first = true;
+    function flush(trailing) {
+      if (!line) return;
+      emitText(line.text, {
+        left: line.left, top: line.top,
+        width: line.right - line.left, height: line.bottom - line.top
+      }, ctx, line.ls, trailing);
+      line = null;
+    }
+    function add(text, r, spaceBefore) {
+      if (line && sameLine(line, r)) {
+        line.text += (spaceBefore ? ' ' : '') + text;
+        line.left = Math.min(line.left, r.left);
+        line.top = Math.min(line.top, r.top);
+        line.right = Math.max(line.right, r.right);
+        line.bottom = Math.max(line.bottom, r.bottom);
+        return;
+      }
+      flush(spaceBefore);
+      line = {text: text, left: r.left, top: r.top, right: r.right, bottom: r.bottom,
+              ls: first ? ls : spaceBefore};
+    }
+    var re = /\S+/g, m;
+    while ((m = re.exec(raw))) {
+      var word = m[0], start = m.index;
+      var wr = rectsOf(node, start, start + word.length);
+      if (wr.length === 0) continue;
+      if (wr.length === 1) {
+        add(word, wr[0], !first);
+      } else {
+        // 단어 중간에서 줄이 바뀜 (한글은 음절 단위로 감김) → 글자 단위
+        var piece = '', pr = null, sp = !first;
+        for (var i = 0; i < word.length; i++) {
+          var cr = rectsOf(node, start + i, start + i + 1);
+          var c = cr.length ? cr[0] : null;
+          if (pr && c && !(Math.abs(c.top - pr.top) < Math.min(pr.height, c.height) * 0.5)) {
+            add(piece, pr, sp);
+            piece = ''; pr = null; sp = false;
+          }
+          piece += word[i];
+          if (c) {
+            pr = pr ? {left: Math.min(pr.left, c.left), top: Math.min(pr.top, c.top),
+                       right: Math.max(pr.right, c.right), bottom: Math.max(pr.bottom, c.bottom),
+                       height: Math.max(pr.height, c.height)}
+                    : {left: c.left, top: c.top, right: c.right, bottom: c.bottom, height: c.height};
+          }
+        }
+        if (piece && pr) add(piece, pr, sp);
+      }
+      first = false;
+    }
+    flush(ts);
+  }
+
   // lazy-load 대응 — placeholder 가 아닌 진짜 이미지 URL 찾기.
-  // 절대 URL 로 정규화 (protocol-relative, 상대 경로 모두 처리).
   function absolutize(url) {
     if (!url) return '';
     url = url.trim();
@@ -108,25 +247,17 @@ JSON.stringify((function() {
     if (url.startsWith('data:')) return '';
     if (url.startsWith('//')) return location.protocol + url;
     if (url.startsWith('http://') || url.startsWith('https://')) return url;
-    try {
-      return new URL(url, location.href).href;
-    } catch (e) {
-      return url;
-    }
+    try { return new URL(url, location.href).href; } catch (e) { return url; }
   }
 
   function realImgSrc(img) {
     try {
-      // img.currentSrc 가 가장 신뢰성 높음 (브라우저가 srcset 평가 후 선택한 URL)
-      if (img.currentSrc && !img.currentSrc.startsWith('data:')) {
-        return absolutize(img.currentSrc);
-      }
+      if (img.currentSrc && !img.currentSrc.startsWith('data:')) return absolutize(img.currentSrc);
       var sets = img.srcset || img.getAttribute('srcset') || '';
       if (sets) {
         var parts = sets.split(',');
         for (var i = parts.length - 1; i >= 0; i--) {
-          var url = parts[i].trim().split(/\s+/)[0];
-          var abs = absolutize(url);
+          var abs = absolutize(parts[i].trim().split(/\s+/)[0]);
           if (abs) return abs;
         }
       }
@@ -134,8 +265,7 @@ JSON.stringify((function() {
       for (var k = 0; k < attrs.length; k++) {
         var v = img.getAttribute(attrs[k]);
         if (v) {
-          var first = v.split(',')[0].trim().split(/\s+/)[0];
-          var abs2 = absolutize(first);
+          var abs2 = absolutize(v.split(',')[0].trim().split(/\s+/)[0]);
           if (abs2) return abs2;
         }
       }
@@ -145,43 +275,111 @@ JSON.stringify((function() {
     }
   }
 
-  function pushImage(el, href, fn) {
+  function pushImage(el, ctx) {
     var r = el.getBoundingClientRect();
-    if (r.width === 0 && r.height === 0) return;
+    if (r.width < 6 && r.height < 6) return;
+    if (!visibleIn(ctx.clip, r)) return;
     var tok = {
-      t: 'i',
-      src: realImgSrc(el),
-      alt: el.alt || '',
-      x: Math.round(r.left + window.scrollX),
-      y: Math.round(r.top + window.scrollY),
-      w: Math.round(r.width),
-      h: Math.round(r.height)
+      t: 'i', src: realImgSrc(el), alt: el.alt || '',
+      x: Math.round(r.left + sx), y: Math.round(r.top + sy),
+      w: Math.round(r.width), h: Math.round(r.height),
+      b: ctx.blk
     };
-    if (fn) tok.fn = fn;
-    else if (href) tok.href = href;
+    if (ctx.fn) tok.fn = ctx.fn;
+    else if (ctx.href) tok.href = ctx.href;
     tokens.push(tok);
   }
 
-  function walk(el, parentHref, parentFn) {
-    if (!el) return;
-    if (el.nodeType === 1 && (SKIP[el.nodeName] || isHidden(el) || isAd(el))) return;
+  // 본문에 끼워 넣은 동영상(YouTube 등 iframe) — 내용은 못 가져오므로 자리 + 주소만
+  function pushEmbed(el, ctx) {
+    var src = absolutize(el.getAttribute('src') || '');
+    if (!src || !/^https?:/.test(src) || isAd(el)) return;
+    if (!/youtube|youtu\.be|vimeo|kakao|naver|dailymotion|nicovideo|bilibili|twitch/i.test(src)) return;
+    var r = el.getBoundingClientRect();
+    if (r.width < 80 || r.height < 40 || !visibleIn(ctx.clip, r)) return;
+    var s = window.getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden') return;
+    tokens.push({t: 'v', src: src,
+                 x: Math.round(r.left + sx), y: Math.round(r.top + sy),
+                 w: Math.round(r.width), h: Math.round(r.height), b: ctx.blk});
+  }
+
+  var BULLET = {disc: '•', circle: '◦', square: '▪'};
+  function markerText(li, type) {
+    if (BULLET[type]) return BULLET[type];
+    var n = 1;
+    if (li.value) n = li.value;
+    else {
+      var par = li.parentElement;
+      if (par && par.nodeName === 'OL' && par.start) n = par.start;
+      for (var sib = li.previousElementSibling; sib; sib = sib.previousElementSibling) {
+        if (sib.nodeName === 'LI') n++;
+      }
+    }
+    if (type === 'lower-alpha' || type === 'lower-latin') return String.fromCharCode(96 + ((n - 1) % 26) + 1) + '.';
+    if (type === 'upper-alpha' || type === 'upper-latin') return String.fromCharCode(64 + ((n - 1) % 26) + 1) + '.';
+    if (type === 'lower-roman' || type === 'upper-roman') {
+      var R = [[1000,'m'],[900,'cm'],[500,'d'],[400,'cd'],[100,'c'],[90,'xc'],[50,'l'],[40,'xl'],[10,'x'],[9,'ix'],[5,'v'],[4,'iv'],[1,'i']];
+      var out = '', v = n;
+      for (var k = 0; k < R.length; k++) while (v >= R[k][0]) { out += R[k][1]; v -= R[k][0]; }
+      return (type === 'upper-roman' ? out.toUpperCase() : out) + '.';
+    }
+    return n + '.';
+  }
+
+  function walk(el, ctx) {
     var ch = el.childNodes;
     for (var i = 0; i < ch.length; i++) {
       var c = ch[i];
-      if (c.nodeType === 3) {
-        pushText(c, parentHref, parentFn);
-      } else if (c.nodeType === 1) {
-        if (c.nodeName === 'IMG') {
-          pushImage(c, parentHref, parentFn);
-        } else if (c.nodeName === 'A') {
-          var h = c.getAttribute('href') || '';
-          try { if (h && c.href) h = c.href; } catch (e) {}
-          var fn = resolveFootnote(h);
-          walk(c, fn ? null : (h || parentHref), fn || parentFn);
-        } else {
-          walk(c, parentHref, parentFn);
+      if (c.nodeType === 3) { pushText(c, ctx); continue; }
+      if (c.nodeType === 1 && c.nodeName === 'IFRAME') { pushEmbed(c, ctx); continue; }
+      if (c.nodeType !== 1 || SKIP[c.nodeName]) continue;
+      var s;
+      try { s = window.getComputedStyle(c); } catch (e) { continue; }
+      if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse') continue;
+      if (num(s.opacity) === 0 && s.opacity !== '') continue;
+      if (isAd(c)) continue;
+
+      var n = {href: ctx.href, fn: ctx.fn, clip: ctx.clip, blk: ctx.blk,
+               st: ctx.st, strike: ctx.strike};
+      if ((s.textDecorationLine || '').indexOf('line-through') >= 0) n.strike = 1;
+
+      var disp = s.display;
+      var r = null;
+      if (disp !== 'inline' && disp !== 'contents') {
+        r = c.getBoundingClientRect();
+        n.blk = nBlocks++;
+        // overflow:auto/scroll 은 스크롤하면 볼 수 있으므로 자르지 않는다
+        var ox = s.overflowX, oy = s.overflowY;
+        if (ox === 'hidden' || ox === 'clip' || oy === 'hidden' || oy === 'clip') {
+          n.clip = inter(ctx.clip, {
+            l: (ox === 'hidden' || ox === 'clip') ? r.left + sx : -1e9,
+            r: (ox === 'hidden' || ox === 'clip') ? r.right + sx : 1e9,
+            t: (oy === 'hidden' || oy === 'clip') ? r.top + sy : -1e9,
+            b: (oy === 'hidden' || oy === 'clip') ? r.bottom + sy : 1e9
+          });
+          if (n.clip.r - n.clip.l < 1 || n.clip.b - n.clip.t < 1) continue;
+        }
+        if (disp === 'list-item' && s.listStyleType && s.listStyleType !== 'none') {
+          var fs = num(s.fontSize) || 15;
+          var mt = markerText(c, s.listStyleType);
+          var mw = fs * (mt.length > 1 ? mt.length * 0.6 : 0.8);
+          n.st = styleOf(s, n);
+          emitText(mt, {left: r.left - mw - fs * 0.4, top: r.top, width: mw,
+                        height: num(s.lineHeight) || fs * 1.5}, n, false, true);
         }
       }
+      n.st = styleOf(s, n);
+
+      if (c.nodeName === 'IMG') { pushImage(c, n); continue; }
+      if (c.nodeName === 'A') {
+        var h = c.getAttribute('href') || '';
+        try { if (h && c.href) h = c.href; } catch (e) {}
+        var fn = resolveFootnote(h);
+        if (fn) { n.fn = fn; n.href = null; }
+        else if (h && !/^javascript:/i.test(h)) n.href = h;
+      }
+      walk(c, n);
     }
   }
 
@@ -189,27 +387,25 @@ JSON.stringify((function() {
   try {
     window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
     window.scrollTo(0, 0);
+    sx = window.scrollX; sy = window.scrollY;
   } catch (e) {}
 
   try {
-    var root = document.body;
-    if (!root) {
-      return { ok: false, sel: 'no-body',
-               title: document.title, url: location.href,
+    if (!document.body) {
+      return { ok: false, sel: 'no-body', title: document.title, url: location.href,
                readyState: document.readyState };
     }
-    walk(root);
+    var root = contentRoot();
+    walk(root, {href: null, fn: null, clip: null, blk: -1,
+                st: styleOf(window.getComputedStyle(root), {}), strike: 0});
     return {
-      ok: true,
-      sel: 'positioned',
-      tokens: tokens,
-      pageW: document.documentElement.scrollWidth,
-      pageH: document.documentElement.scrollHeight,
-      title: document.title,
-      url: location.href
+      ok: true, sel: root === document.body ? 'body' : 'content',
+      tokens: tokens, styles: styles,
+      pageW: pageW, pageH: pageH,
+      title: document.title, url: location.href
     };
   } catch (e) {
-    return { ok: false, sel: 'error', error: String(e) };
+    return { ok: false, sel: 'error', error: String(e) + ' @ ' + (e.stack || '') };
   }
 })());
 """
@@ -220,8 +416,10 @@ class NamuLoader(QObject):
 
     loadStarted = Signal(str)
     loadProgress = Signal(int)
-    # title, tokens (list[dict] — 각 토큰은 x/y/w/h 포함), source_url, page_w, page_h
-    bodyExtracted = Signal(str, list, str, int, int)
+    # title, doc (tokens/styles/pageW/pageH — namuformatter 입력), source_url
+    bodyExtracted = Signal(str, dict, str)
+    # 창 크기 변경으로 같은 페이지를 새 폭으로 다시 배치해서 읽은 결과: source_url, doc
+    relayoutDone = Signal(str, dict)
     fetchFailed = Signal(str, str)
     diagnostics = Signal(dict)
 
@@ -253,11 +451,55 @@ class NamuLoader(QObject):
 
         self._current_title = ""
         self._current_url = ""
+        self._gen = 0  # fetch 세대 — 이전 로드의 지연 추출 타이머가 새 페이지에 끼어들지 않게
+        self._page_ready = False  # 현재 페이지 추출까지 끝났는지 (다시 배치 가능 여부)
+        self._relayout_gen = 0
         self._extract_attempts = 0
         self._max_attempts = 4
         self._extract_delay_ms = 5000
 
         self._debug_view: QWebEngineView | None = None
+
+    def setPageWidth(self, css_px: int) -> None:
+        """렌더링 폭(CSS px). 시트 폭에 맞춰 두면 줄바꿈 위치가 시트와 같아진다.
+
+        창을 줄이면 이 폭도 줄어든다 — 좁으면 나무위키도 좁은 화면용 배치(사이드바 없음)로 바뀜.
+        """
+        css_px = max(360, min(3000, int(css_px)))
+        if self._hidden_view is not None and self._hidden_view.width() != css_px:
+            self._hidden_view.resize(css_px, 900)
+
+    def loadedUrl(self) -> str:
+        """다시 배치(relayout)할 수 있는 상태로 열려 있는 페이지 주소. 없으면 ""."""
+        return self._current_url if self._page_ready else ""
+
+    def relayout(self, css_px: int) -> bool:
+        """지금 열린 페이지를 새 폭으로 다시 배치하고 다시 추출 (네트워크 없이).
+
+        결과는 relayoutDone 으로. 페이지가 준비 안 됐으면 False.
+        """
+        if not self._page_ready or self._page is None:
+            return False
+        self.setPageWidth(css_px)
+        self._relayout_gen += 1
+        gen = self._relayout_gen
+
+        def run() -> None:
+            if gen != self._relayout_gen or not self._page_ready or self._page is None:
+                return
+            self._page.runJavaScript(
+                _EXTRACT_JS, lambda res, g=gen: self._on_relayout_extracted(res, g)
+            )
+        # 크기 변경 후 렌더러가 다시 배치할 시간
+        QTimer.singleShot(400, run)
+        return True
+
+    def _on_relayout_extracted(self, result, gen: int) -> None:
+        if gen != self._relayout_gen or not self._page_ready:
+            return
+        info = self._parse_result(result)
+        if info.get("ok") and info.get("tokens"):
+            self.relayoutDone.emit(self._current_url, self._doc_from(info))
 
     def cleanup(self) -> None:
         """앱 종료 시 명시적으로 호출 — QtWebEngine helper 프로세스가 좀비로 남지 않게.
@@ -336,10 +578,15 @@ class NamuLoader(QObject):
                 else:
                     raise FileNotFoundError
             except Exception:
+                # 나무위키 검색창과 같은 /Go 경로 — 띄어쓰기/대소문자가 달라도 문서를 찾아가고,
+                # 없으면 검색 결과 페이지로 간다. (/w/제목 은 정확히 일치해야만 열림)
                 self._current_title = s
-                self._current_url = f"https://namu.wiki/w/{quote(s, safe='')}"
+                self._current_url = f"https://namu.wiki/Go?q={quote(s, safe='')}"
                 qurl = QUrl(self._current_url)
 
+        self._gen += 1
+        self._page_ready = False
+        self._relayout_gen += 1   # 진행 중이던 다시 배치는 무효
         self._extract_attempts = 0
         self.loadStarted.emit(self._current_title)
         self._page.load(qurl)
@@ -348,39 +595,69 @@ class NamuLoader(QObject):
         if not ok:
             self.fetchFailed.emit(self._current_title, "페이지 로드 실패")
             return
-        QTimer.singleShot(self._extract_delay_ms, self._run_extract)
+        gen = self._gen
+        QTimer.singleShot(self._extract_delay_ms, lambda: self._run_extract(gen))
 
-    def _run_extract(self) -> None:
+    def _run_extract(self, gen: int) -> None:
+        if gen != self._gen or self._page is None:
+            return
         self._extract_attempts += 1
-        self._page.runJavaScript(_EXTRACT_JS, self._on_extracted)
+        self._page.runJavaScript(
+            _EXTRACT_JS, lambda res, g=gen: self._on_extracted(res, g)
+        )
 
-    def _on_extracted(self, result) -> None:
-        info: dict = {}
+    @staticmethod
+    def _page_title(doc_title: str, url: str, fallback: str) -> str:
+        """document.title("악어 - 나무위키") / URL 에서 실제 문서 제목."""
+        t = (doc_title or "").strip()
+        for suffix in (" - 나무위키", " - namu.wiki"):
+            if t.endswith(suffix):
+                t = t[: -len(suffix)].strip()
+        if "/Search?" in (url or ""):
+            q = (parse_qs(urlparse(url).query).get("q") or [""])[0]
+            return f"검색: {q}" if q else (t or fallback)
+        return t or fallback
+
+    @staticmethod
+    def _parse_result(result) -> dict:
         if isinstance(result, str) and result:
             try:
-                info = json.loads(result)
+                return json.loads(result)
             except Exception as e:
-                info = {"ok": False, "sel": "json-parse-error",
+                return {"ok": False, "sel": "json-parse-error",
                         "error": f"JSON.parse 실패: {e}", "raw_head": result[:300]}
-        elif isinstance(result, dict):
-            info = result
-        else:
-            info = {"ok": False, "sel": "no-result",
-                    "error": f"runJavaScript 결과가 빈 값 (type={type(result).__name__})"}
+        if isinstance(result, dict):
+            return result
+        return {"ok": False, "sel": "no-result",
+                "error": f"runJavaScript 결과가 빈 값 (type={type(result).__name__})"}
 
+    def _doc_from(self, info: dict) -> dict:
+        return {
+            "tokens": info.get("tokens") or [],
+            "styles": info.get("styles") or [],
+            "pageW": int(info.get("pageW") or 1280),
+            "pageH": int(info.get("pageH") or 800),
+            # 이 문서를 렌더링한 폭 — 창 크기와 다르면 다시 배치 대상
+            "renderW": self._hidden_view.width() if self._hidden_view is not None else 0,
+        }
+
+    def _on_extracted(self, result, gen: int) -> None:
+        if gen != self._gen:
+            return
+        info = self._parse_result(result)
         ok = bool(info.get("ok"))
         tokens = info.get("tokens") or []
 
         if ok and tokens:
-            page_w = int(info.get("pageW") or 1280)
-            page_h = int(info.get("pageH") or 800)
-            self.bodyExtracted.emit(
-                self._current_title, tokens, self._current_url, page_w, page_h
-            )
+            url = info.get("url") or self._current_url
+            self._current_title = self._page_title(info.get("title", ""), url, self._current_title)
+            self._current_url = url
+            self._page_ready = True
+            self.bodyExtracted.emit(self._current_title, self._doc_from(info), self._current_url)
             return
 
         if self._extract_attempts < self._max_attempts:
-            QTimer.singleShot(1500, self._run_extract)
+            QTimer.singleShot(1500, lambda: self._run_extract(gen))
             return
 
         self.diagnostics.emit(info)

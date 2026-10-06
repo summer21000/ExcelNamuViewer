@@ -1,252 +1,384 @@
 from __future__ import annotations
 
-"""positioned token (x/y/w/h) → 셀 매트릭스.
+"""positioned token (x/y/w/h) → 셀 레이아웃.
 
-같은 행에서 가까이 붙어있는 토큰은 한 셀에 자동 join,
-멀리 떨어진 토큰 사이는 빈 셀로 두어 페이지 좌우 구조 유지.
+대원칙은 "엑셀로 보일 것". 페이지에서는 구조만 가져온다:
+  - 셀 너비는 시트 기본 열 너비 하나로 고정 (배율을 바꿀 때만 변함). 글자는 셀 너비만큼
+    잘라 한 셀에 하나씩 넣고, 나머지는 다음 셀에 이어 쓴다 — 셀을 병합하거나 옆 칸으로
+    넘쳐 그리지 않는다. 줄 끝에 닿으면 아래 행으로 이어진다.
+  - 각 텍스트 조각은 페이지상의 x 위치에 해당하는 열에서 시작 → 들여쓰기 / 표의 열 /
+    정보상자 위치가 대략 유지됨.
+  - 행은 "화면상의 한 줄" 단위로 묶는다 (세로 겹침 기준) — 줄 순서가 섞이지 않는다.
+  - 글꼴 크기·글자색·배경색·행 높이는 페이지를 따르지 않는다. 모든 셀은 시트 기본 글꼴과
+    기본 행 높이를 쓰고, 문단 사이 간격은 빈 행 한 줄로만 남긴다.
 """
 
-# 한 토큰을 자기 시작 좌표에 둘 때 사용하는 그리드 분해능
-COL_WIDTH = 90       # px / cell  (셀 한 칸 가로폭의 명목값)
-ROW_HEIGHT = 24      # px / cell  (셀 한 칸 세로폭)
+from dataclasses import dataclass, field, replace
+from typing import Callable
 
-# 같은 행에서 인접 토큰 사이의 가로 간격이 이 값 미만이면 같은 셀로 join.
-JOIN_GAP_PX = 30
+# 시트 기본 열 너비 (px, 배율 100%) — 위장 시트와 같음
+COL_PX = 82
+# 셀 너비 중 글자가 못 쓰는 부분 (스타일 여백 3+3 + QSS ::item padding 3+3 + 여유 2).
+# 이보다 넓은 글자는 셀에 다 안 보이므로 잘라서 다음 셀로 넘긴다.
+CELL_TEXT_MARGIN = 14
+# 그림/동영상 자리를 줄 묶기에 쓸 때의 높이 (실제 그림 높이 대신 한 줄)
+IMAGE_ROW_PX = 20
+# 앞 줄과 이만큼(앞 줄 높이 대비) 이상 떨어져 있으면 빈 행 한 줄을 둔다 — 문단 구분
+PARAGRAPH_GAP = 0.5
+# 이어지는 줄이 시작할 열에서 오른쪽 끝까지 최소 이만큼은 있어야 함 (아니면 왼쪽부터)
+MIN_WRAP_COLS = 3
+# 같은 블록에서 페이지상 간격이 이 셀 수 미만이면 바로 이어지는 조각으로 본다
+INLINE_GAP_CELLS = 1.5
+# 셀을 자를 때 끝에서 이 글자 수 안에 띄어쓰기가 있으면 거기서 자른다
+CHUNK_SPACE_SNAP = 2
 
-# 한 셀의 텍스트 폭 한도. 한글 1자 = 2 단위, 영문 1자 = 1 단위.
-# 한글 6자 (= 12 단위) 기준. 사용자 선호.
-CELL_WIDTH_UNITS = 12
+MAX_ROWS = 20000
 
-# 한 row 에 들어갈 셀 수의 최대치. 이를 넘는 텍스트는 다음 row 로 줄바꿈 (브라우저처럼).
-MAX_COLS_VISIBLE = 18
-
-MAX_COLS = 80
-MAX_ROWS = 5000
-
-
-def _char_w(ch: str) -> int:
-    """대략적인 폭 — ASCII 1, 그 외 (한글/한자/이모지) 2."""
-    return 1 if ord(ch) < 128 else 2
-
-
-def _text_w(text: str) -> int:
-    return sum(_char_w(c) for c in text)
+# measure(text, font_px, bold) -> 실제 셀 글꼴로 그렸을 때의 폭(px)
+Measure = Callable[[str, int, bool], float]
 
 
-def _split_text_to_cells(text: str, max_w: int) -> list[str]:
-    """띄어쓰기(단어) 경계 우선으로 잘라 옆 셀로 흘림.
-
-    여러 단어가 셀 폭에 들어가면 한 셀에 합치고, 한 단어가 폭을 넘으면 강제 분할.
-    """
-    text = text.strip()
-    if not text:
-        return []
-    if _text_w(text) <= max_w:
-        return [text]
-
-    def cut_by_width(s: str, w: int) -> tuple[str, str]:
-        acc = 0
-        for i, ch in enumerate(s):
-            cw = _char_w(ch)
-            if acc + cw > w:
-                return s[:i], s[i:]
-            acc += cw
-        return s, ""
-
-    out: list[str] = []
-    words = text.split(" ")
-    cur = ""
-    cur_w = 0
-    for w in words:
-        ww = _text_w(w)
-        sep = 1 if cur else 0
-        if cur_w + sep + ww <= max_w:
-            cur = (cur + " " + w) if cur else w
-            cur_w += sep + ww
-            continue
-        if cur:
-            out.append(cur)
-            cur, cur_w = "", 0
-        # 단어 자체가 셀 폭 보다 큰 경우 강제 분할
-        while _text_w(w) > max_w:
-            head, w = cut_by_width(w, max_w)
-            if head:
-                out.append(head)
-            else:
-                break
-        cur = w
-        cur_w = _text_w(w)
-    if cur:
-        out.append(cur)
-    return out
+def text_px_per_cell(col_px: int) -> int:
+    """셀 하나에 넣을 수 있는 글자 폭 (px)."""
+    return max(8, col_px - CELL_TEXT_MARGIN)
 
 
-def _is_text(tok: dict) -> bool:
-    return tok.get("t") == "x"
+@dataclass
+class CellSpec:
+    row: int
+    col: int
+    text: str
+    bold: bool = False
+    italic: bool = False
+    strike: bool = False
+    image: str | None = None
+    link: str | None = None
+    footnote: str | None = None
+
+
+@dataclass
+class SheetLayout:
+    cells: list[CellSpec] = field(default_factory=list)
+    n_rows: int = 0
+    n_cols: int = 0
+
+
+def _default_measure(text: str, font_px: int, bold: bool) -> float:
+    w = 0.0
+    for ch in text:
+        w += 0.55 if ord(ch) < 128 else 1.0
+    return w * font_px * (1.05 if bold else 1.0)
 
 
 # 앞 토큰에 무조건 붙는 부호류 (href 가 달라도 join).
-_PUNCT_GLUE = set(",.;:!?)\"'》」』]·…—–-")
+_PUNCT_GLUE = set(",.;:!?)\"'》」』]·…—–-~%")
+# 뒤 토큰에 붙는 여는 부호류
+_PUNCT_OPEN = set("(\"'《「『[")
 
 
-def _is_punct_only(v: str) -> bool:
+def _is_punct_only(v: str, chars: set[str]) -> bool:
     s = (v or "").strip()
-    if not s:
-        return False
-    return all(ch in _PUNCT_GLUE for ch in s)
+    return bool(s) and all(ch in chars for ch in s)
 
 
-def _dedup_images_in_row(row_tokens: list[dict]) -> list[dict]:
-    """같은 행 안에서 동일 src 이미지가 여러 번 잡히면 (thumb+full 등) 한 번만 남김."""
-    seen: set[str] = set()
-    out: list[dict] = []
-    for tok in row_tokens:
+class _Frag:
+    __slots__ = ("kind", "text", "x0", "x1", "y0", "y1", "bottom", "blk", "style",
+                 "href", "fn", "src", "ls", "ts")
+
+    def __init__(self, **kw) -> None:
+        for k in self.__slots__:
+            setattr(self, k, kw.get(k))
+
+    @property
+    def h(self) -> float:
+        return self.y1 - self.y0
+
+
+def _vertical_overlap(a0: float, a1: float, b0: float, b1: float) -> float:
+    ov = min(a1, b1) - max(a0, b0)
+    if ov <= 0:
+        return 0.0
+    return ov / max(1e-6, min(a1 - a0, b1 - b0))
+
+
+def _build_frags(doc: dict, k: float) -> list[_Frag]:
+    tokens = doc.get("tokens") or []
+    styles = doc.get("styles") or []
+    frags: list[_Frag] = []
+    seen_img: set[tuple] = set()
+    for tok in tokens:
+        x, y = float(tok.get("x", 0)), float(tok.get("y", 0))
+        w, h = float(tok.get("w", 0)), float(tok.get("h", 0))
+        if tok.get("t") == "v":
+            frags.append(_Frag(
+                kind="v", text="", x0=x * k, x1=(x + w) * k, y0=y * k,
+                y1=y * k + min(h * k, IMAGE_ROW_PX), bottom=(y + h) * k,
+                blk=tok.get("b"), style=None, href=None, fn=None,
+                src=(tok.get("src") or "").strip(),
+            ))
+            continue
         if tok.get("t") == "i":
             src = (tok.get("src") or "").strip()
-            if src and src in seen:
+            if not src:
+                continue  # lazy-load placeholder — 같은 자리에 진짜 img 가 따로 있음
+            key = (round(x), round(y), round(w), round(h), src)
+            if key in seen_img:
                 continue
-            if src:
-                seen.add(src)
-        out.append(tok)
+            seen_img.add(key)
+            frags.append(_Frag(
+                kind="i", text=(tok.get("alt") or "").strip(),
+                x0=x * k, x1=(x + w) * k, y0=y * k,
+                y1=y * k + min(h * k, IMAGE_ROW_PX), bottom=(y + h) * k,
+                blk=tok.get("b"), style=None,
+                href=(tok.get("href") or None), fn=(tok.get("fn") or None), src=src,
+            ))
+            continue
+        text = (tok.get("v") or "").strip()
+        if not text:
+            continue
+        si = tok.get("s")
+        st = styles[si] if isinstance(si, int) and 0 <= si < len(styles) else {}
+        frags.append(_Frag(
+            kind="x", text=text,
+            x0=x * k, x1=(x + w) * k, y0=y * k, y1=(y + h) * k, bottom=(y + h) * k,
+            blk=tok.get("b"), style=st,
+            href=(tok.get("href") or None), fn=(tok.get("fn") or None),
+            ls=bool(tok.get("ls")), ts=bool(tok.get("ts")),
+        ))
+    return frags
+
+
+def _merge_inline(frags: list[_Frag]) -> list[_Frag]:
+    """문서 순서상 이어지는, 같은 줄·같은 블록의 텍스트 조각을 합친다.
+
+    - 링크/각주가 다르면 분리 (셀마다 링크 하나)
+    - 글꼴 스타일이 다르면 분리 (굵게/색 유지) — 단, 2자 이하 짧은 조각은 합침
+    - 부호만 있는 조각은 링크가 달라도 앞/뒤 조각에 붙인다
+    """
+    out: list[_Frag] = []
+    for f in frags:
+        prev = out[-1] if out else None
+        if (prev is None or prev.kind != "x" or f.kind != "x" or prev.blk != f.blk
+                or _vertical_overlap(prev.y0, prev.y1, f.y0, f.y1) < 0.5):
+            out.append(f)
+            continue
+        fs = max(prev.y1 - prev.y0, 1.0) * 0.7   # 조각 높이 ≈ 글자 크기 × 1.4
+        gap = f.x0 - prev.x1
+        if gap < -2 or gap > max(6.0, fs):
+            out.append(f)
+            continue
+        same_link = prev.href == f.href and prev.fn == f.fn
+        same_style = prev.style == f.style
+        short = len(prev.text) <= 2 or len(f.text) <= 2
+        glue_back = _is_punct_only(f.text, _PUNCT_GLUE)
+        glue_fwd = _is_punct_only(prev.text, _PUNCT_OPEN) and not prev.href and not prev.fn
+        if not (glue_back or glue_fwd or (same_link and (same_style or short))):
+            out.append(f)
+            continue
+        sep = " " if (prev.ts or f.ls or gap > fs * 0.2) else ""
+        if glue_back and not f.ls:
+            sep = ""
+        if glue_fwd:
+            # 여는 괄호는 뒤 조각(링크 등)의 속성을 따른다
+            prev.href, prev.fn, prev.style = f.href, f.fn, f.style
+            if not prev.ts:
+                sep = ""
+        elif len(f.text) > len(prev.text) and not same_style and not glue_back:
+            prev.style = f.style
+        prev.text = prev.text + sep + f.text
+        prev.x1 = max(prev.x1, f.x1)
+        prev.y0 = min(prev.y0, f.y0)
+        prev.y1 = max(prev.y1, f.y1)
+        prev.bottom = max(prev.bottom, f.bottom)
+        prev.ts = f.ts
     return out
 
 
-def _merge_inline(row_tokens: list[dict]) -> list[dict]:
-    """같은 행 안에서 가까이 있는 텍스트 토큰들을 한 토큰으로 합친다.
+class _Row:
+    __slots__ = ("top", "bot", "frags")
 
-    - 링크(href) / 각주(fn) 가 다르면 분리 유지
-    - 단, 토큰 내용이 부호류 ( , . ; : 등) 만 있으면 href 가 달라도 앞에 붙임
-      (단어 사이 punctuation 이 별도 셀에 떨어지는 것 방지)
-    """
-    merged: list[dict] = []
-    for tok in sorted(row_tokens, key=lambda t: int(t.get("x", 0))):
-        if not _is_text(tok) or not merged or not _is_text(merged[-1]):
-            merged.append(dict(tok))
-            continue
-        prev = merged[-1]
-        punct = _is_punct_only(tok.get("v", ""))
-        same_link = (prev.get("href") == tok.get("href")
-                     and prev.get("fn") == tok.get("fn"))
-        if not punct and not same_link:
-            merged.append(dict(tok))
-            continue
-        prev_right = int(prev.get("x", 0)) + int(prev.get("w", 0))
-        gap = int(tok.get("x", 0)) - prev_right
-        if gap < JOIN_GAP_PX:
-            sep = "" if punct else " "
-            prev["v"] = (prev.get("v") or "") + sep + (tok.get("v") or "")
-            prev["w"] = int(prev.get("w", 0)) + max(0, gap) + int(tok.get("w", 0))
+    def __init__(self, f: _Frag) -> None:
+        self.top, self.bot, self.frags = f.y0, f.y1, [f]
+
+
+def _cluster_rows(frags: list[_Frag], unit: float = 1.0) -> list[_Row]:
+    """세로로 충분히 겹치는 조각끼리 한 행. 가로로 겹치는 조각은 절대 같은 행에 넣지 않는다.
+
+    unit: x 좌표 1px 에 해당하는 값 (겹침 판정 오차)."""
+    rows: list[_Row] = []
+    for f in sorted(frags, key=lambda q: q.y0):
+        best, best_ov = None, 0.3
+        fy0, fy1 = f.y0, f.y1
+        for row in reversed(rows[-12:]):
+            if row.bot <= fy0:
+                if row.bot < fy0 - 400:
+                    break
+                continue
+            ov = min(row.bot, fy1) - max(row.top, fy0)
+            if ov <= 0:
+                continue
+            ov /= max(1e-6, min(row.bot - row.top, fy1 - fy0))
+            if ov < best_ov:
+                continue
+            if any(f.x0 < g.x1 - unit and g.x0 < f.x1 - unit for g in row.frags):
+                continue
+            best, best_ov = row, ov
+        if best is None:
+            rows.append(_Row(f))
         else:
-            merged.append(dict(tok))
-    return merged
-
-
-def format_positioned(
-    title: str,
-    tokens: list[dict],
-    page_w: int = 1280,
-    page_h: int = 0,
-    max_cols: int | None = None,
-) -> list[list[tuple]]:
-    if not tokens:
-        return []
-
-    # 좌상단을 (0, 0) 기준으로 맞춤 (페이지가 (0,0) 부터 시작 안 할 수도)
-    xs = [int(t.get("x", 0)) for t in tokens]
-    ys = [int(t.get("y", 0)) for t in tokens]
-    min_x = max(0, min(xs))
-    min_y = max(0, min(ys))
-
-    # row 그룹
-    by_row: dict[int, list[dict]] = {}
-    for tok in tokens:
-        y = int(tok.get("y", 0)) - min_y
-        if y < 0:
-            continue
-        r = y // ROW_HEIGHT
-        if r >= MAX_ROWS:
-            continue
-        adj = dict(tok)
-        adj["x"] = int(tok.get("x", 0)) - min_x
-        adj["y"] = y
-        by_row.setdefault(r, []).append(adj)
-
-    rows_out: list[list[tuple]] = []
-    max_r = max(by_row.keys()) if by_row else 0
-
-    # 셀 1칸 = (text, bold, image_url|None, link_url|None, footnote|None)
-    def commit_row(cells: list[tuple]) -> None:
-        if not cells:
-            cells = [("", False, None, None, None)]
-        rows_out.append(cells)
-
-    # 연속 빈 row 는 1개로 압축 (문단 간격 과도하게 벌어지지 않게)
-    empty_streak = 0
-    for r in range(max_r + 1):
-        group = by_row.get(r, [])
-        if not group:
-            empty_streak += 1
-            if empty_streak <= 1:
-                rows_out.append([("", False, None, None, None)])
-            continue
-        empty_streak = 0
-        group = _dedup_images_in_row(group)
-        merged = _merge_inline(group)
-        row_cells: list[tuple] = []
-        col = 0
-
-        def append_cell(
-            text: str,
-            img: str | None,
-            link: str | None,
-            fn: str | None,
-        ) -> None:
-            nonlocal row_cells, col
-            limit = max_cols if (max_cols and max_cols > 0) else MAX_COLS_VISIBLE
-            if col >= limit:
-                commit_row(row_cells)
-                row_cells = []
-                col = 0
-            row_cells.append((text, False, img, link, fn))
-            col += 1
-
-        for tok in merged:
-            href = (tok.get("href") or "").strip() or None
-            fn = (tok.get("fn") or "").strip() or None
-            if _is_text(tok):
-                text = (tok.get("v") or "").strip()
-                if not text:
-                    continue
-                chunks = _split_text_to_cells(text, CELL_WIDTH_UNITS)
-                for ch in chunks:
-                    append_cell(ch, None, href, fn)
-            else:  # image
-                src = (tok.get("src") or "").strip()
-                alt = (tok.get("alt") or "").strip()
-                text = "[사진보기]" + (f" — {alt}" if alt else "")
-                append_cell(text, src, href, fn)
-
-        commit_row(row_cells)
-
-    if title:
-        rows_out = [
-            [(title, True, None, None, None)],
-            [("", False, None, None, None)],
-        ] + rows_out
-
-    return rows_out
-
-
-# legacy text-only fallback
-def format_for_cells(title: str, body: str, **_kw) -> list[list[tuple]]:
-    rows: list[list[tuple]] = []
-    if title:
-        rows.append([(title, True, None, None, None)])
-        rows.append([("", False, None, None, None)])
-    for line in body.split("\n"):
-        line = line.rstrip()
-        if not line.strip():
-            rows.append([("", False, None, None, None)])
-            continue
-        rows.append([(line, False, None, None, None)])
+            best.frags.append(f)
     return rows
+
+
+def format_document(
+    title: str,
+    doc: dict,
+    *,
+    view_w: int,
+    scale: float,
+    col_px: int = COL_PX,
+    font_px: int = 12,
+    measure: Measure | None = None,
+) -> SheetLayout:
+    """페이지 → 시트 배치.
+
+    view_w : 시트의 보이는 폭(px) — 보이는 열 수 = view_w // col_px. 넘치면 아래 행으로.
+    scale  : 페이지 좌표 → 시트 px 비율. 셀 글꼴 / 페이지 글꼴 비율이어야 글자 폭이 맞는다.
+    col_px : 셀(열) 너비 — 모든 셀이 같다.
+    font_px: 시트 기본 글꼴 크기 — 모든 셀이 이 크기 하나로 그려진다 (폭 계산용).
+    """
+    measure = measure or _default_measure
+    k = max(0.05, scale)
+    n_cols = max(1, int(view_w // col_px))
+    cell_text_px = text_px_per_cell(col_px)
+
+    def width(t: str, bold: bool) -> float:
+        return measure(t, font_px, bold)
+
+    lay = SheetLayout(n_cols=n_cols)
+
+    # ---- 제목 행 (frozen) + 빈 행 — 제목도 셀 너비만큼 잘라 이어 쓴다
+    n_title_rows = 0
+    if title:
+        for i, piece in enumerate(_chunks(title, cell_text_px, lambda t: width(t, True))[:n_cols]):
+            lay.cells.append(CellSpec(0, i, piece, bold=True))
+        n_title_rows = 2
+
+    frags = _merge_inline(_build_frags(doc, k))
+    # 페이지 위치 → 셀 위치. 셀 하나에 글자가 cell_text_px 만큼 들어가므로 그 단위로 센다.
+    # 본문 왼쪽 끝은 B열 (A열 한 칸만 여백).
+    if frags:
+        dx = min(f.x0 for f in frags)
+        for f in frags:
+            f.x0 = (f.x0 - dx) / cell_text_px + 1
+            f.x1 = (f.x1 - dx) / cell_text_px + 1
+    rows = _cluster_rows(frags, unit=1.0 / cell_text_px)
+
+    # ---- 화면상의 줄 → 행. 문단 사이(세로로 떨어진 곳)에는 빈 행 한 줄
+    row_of: list[int] = []                  # rows[i] → 행 번호 (이어지는 행 끼우기 전)
+    r_next = n_title_rows
+    cursor = rows[0].top if rows else 0.0
+    prev_h = 0.0
+    for row in rows:
+        if r_next >= MAX_ROWS:
+            break
+        if prev_h and row.top - cursor >= prev_h * PARAGRAPH_GAP:
+            r_next += 1
+        row_of.append(r_next)
+        r_next += 1
+        h = max(f.y1 - f.y0 for f in row.frags)
+        cursor = max(cursor, row.top + h, max(f.bottom for f in row.frags))
+        prev_h = h
+    n_base_rows = r_next
+
+    # ---- 셀 배치 — 조각마다 셀 너비만큼 잘라 한 셀에 하나씩. 같은 문장에서 이어지는 조각은
+    #      바로 다음 셀부터. 줄 끝(보이는 마지막 열)에 닿으면 아래에 끼워 넣은 행으로 이어 쓴다.
+    extra_lines: dict[int, int] = {}            # 행 → 추가로 끼워 넣은 줄 수
+    placed: list[tuple[CellSpec, int, int]] = []  # (셀, 원래 행, 몇 번째 줄)
+    for row, out_r in zip(rows, row_of):
+        items = sorted(row.frags, key=lambda q: q.x0)
+        line = 0          # 0 = 원래 행, 1.. = 이어지는 행
+        cursor_col = 0    # 현재 줄에서 다음으로 쓸 수 있는 열
+        # 이어지는 행은 그 문단(블록)이 이 줄에서 시작한 열부터 — 문단 왼쪽 끝 맞춤
+        block_left: dict = {}
+        for f in items:
+            block_left.setdefault(f.blk, max(0, int(round(f.x0))))
+        prev_f = None
+        for f in items:
+            natural = max(0, int(round(f.x0)))
+            inline_next = (prev_f is not None and prev_f.blk == f.blk
+                           and f.x0 - prev_f.x1 < INLINE_GAP_CELLS)
+            prev_f = f
+            wrap_col = min(block_left.get(f.blk, natural), natural)
+            if n_cols - wrap_col < MIN_WRAP_COLS:
+                wrap_col = min(1, n_cols - 1)
+            st = f.style or {}
+            if f.kind == "v":
+                base = CellSpec(out_r, 0, "[동영상] " + f.src)
+            elif f.kind == "i":
+                label = "[사진보기]" + (f" — {f.text}" if f.text else "")
+                base = CellSpec(out_r, 0, label, image=f.src, link=f.href, footnote=f.fn)
+            else:
+                base = CellSpec(
+                    out_r, 0, f.text,
+                    bold=bool(st.get("b")), italic=bool(st.get("i")), strike=bool(st.get("s")),
+                    link=None if f.fn else f.href, footnote=f.fn,
+                )
+            if line > 0:
+                c = max(cursor_col, wrap_col)
+            elif inline_next:
+                c = cursor_col
+            else:
+                c = max(natural, cursor_col)
+            bold = base.bold
+            for piece in _chunks(base.text, cell_text_px, lambda t: width(t, bold)):
+                if c >= n_cols:
+                    line += 1
+                    c = wrap_col
+                placed.append((replace(base, text=piece, col=c), out_r, line))
+                c += 1
+            cursor_col = c
+        if line:
+            extra_lines[out_r] = line
+
+    # ---- 이어지는 행을 끼워 넣고 행 번호 다시 매기기
+    new_index: list[int] = []
+    shift = 0
+    for r in range(n_base_rows):
+        new_index.append(r + shift)
+        shift += extra_lines.get(r, 0)
+    for cell, base_r, line in placed:
+        cell.row = new_index[base_r] + line
+        lay.cells.append(cell)
+    lay.n_rows = n_base_rows + shift
+    lay.n_cols = max([n_cols] + [c.col + 1 for c in lay.cells])
+    return lay
+
+
+def _chunks(text: str, max_w: float, width_of) -> list[str]:
+    """셀 하나(max_w)에 들어가는 만큼씩 자른 조각들.
+
+    셀을 꽉 채운다 (단어 중간에서도 자름). 띄어쓰기에서만 자르면 셀마다 반 단어씩 비어
+    페이지의 한 줄이 시트에서 두 행이 되기 쉽다. 셀 끝 바로 근처에 띄어쓰기가 있을 때만
+    거기서 자른다.
+    """
+    out: list[str] = []
+    rest = text.strip()
+    while rest:
+        if width_of(rest) <= max_w:
+            out.append(rest)
+            break
+        lo, hi = 0, len(rest)
+        while lo < hi:   # width_of(rest[:lo]) <= max_w 인 최대 lo
+            mid = (lo + hi + 1) // 2
+            if width_of(rest[:mid]) <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        if lo <= 0:
+            lo = 1   # 셀이 한 글자보다 좁을 때
+        sp = rest.rfind(" ", 0, lo + 1)
+        cut = sp if sp >= max(1, lo - CHUNK_SPACE_SNAP) else lo
+        out.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    return out
