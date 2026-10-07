@@ -61,6 +61,8 @@ class SheetLayout:
     cells: list[CellSpec] = field(default_factory=list)
     n_rows: int = 0
     n_cols: int = 0
+    # 페이지 안 이동 대상 id → 행 (목차 숫자 등 "#id" 링크를 누르면 이 행으로)
+    anchors: dict[str, int] = field(default_factory=dict)
 
 
 def _default_measure(text: str, font_px: int, bold: bool) -> float:
@@ -257,21 +259,22 @@ def format_document(
 
     lay = SheetLayout(n_cols=n_cols)
 
-    # ---- 제목 행 (frozen) + 빈 행 — 제목도 셀 너비만큼 잘라 이어 쓴다
+    # ---- 제목 행 (1행, 스크롤과 함께 움직임) — 제목도 셀 너비만큼 잘라 이어 쓴다.
+    #      본문은 바로 2행부터
     n_title_rows = 0
     if title:
         for i, piece in enumerate(_chunks(title, cell_text_px, lambda t: width(t, True))[:n_cols]):
             lay.cells.append(CellSpec(0, i, piece, bold=True))
-        n_title_rows = 2
+        n_title_rows = 1
 
     frags = _merge_inline(_build_frags(doc, k))
     # 페이지 위치 → 셀 위치. 셀 하나에 글자가 cell_text_px 만큼 들어가므로 그 단위로 센다.
-    # 본문 왼쪽 끝은 B열 (A열 한 칸만 여백).
+    # 본문 왼쪽 끝은 A열.
     if frags:
         dx = min(f.x0 for f in frags)
         for f in frags:
-            f.x0 = (f.x0 - dx) / cell_text_px + 1
-            f.x1 = (f.x1 - dx) / cell_text_px + 1
+            f.x0 = (f.x0 - dx) / cell_text_px
+            f.x1 = (f.x1 - dx) / cell_text_px
     rows = _cluster_rows(frags, unit=1.0 / cell_text_px)
 
     # ---- 화면상의 줄 → 행. 문단 사이(세로로 떨어진 곳)에는 빈 행 한 줄
@@ -311,7 +314,7 @@ def format_document(
             prev_f = f
             wrap_col = min(block_left.get(f.blk, natural), natural)
             if n_cols - wrap_col < MIN_WRAP_COLS:
-                wrap_col = min(1, n_cols - 1)
+                wrap_col = 0
             st = f.style or {}
             if f.kind == "v":
                 base = CellSpec(out_r, 0, "[동영상] " + f.src)
@@ -351,6 +354,17 @@ def format_document(
         cell.row = new_index[base_r] + line
         lay.cells.append(cell)
     lay.n_rows = n_base_rows + shift
+
+    # ---- 이동 대상 → 그 높이에서 시작하는 첫 행 (대상보다 아래쪽에 끝나는 첫 줄)
+    for aid, ay in (doc.get("anchors") or {}).items():
+        try:
+            y = float(ay) * k
+        except (TypeError, ValueError):
+            continue
+        for row, out_r in zip(rows, row_of):
+            if row.bot > y + 0.5:
+                lay.anchors[aid] = new_index[out_r]
+                break
     lay.n_cols = max([n_cols] + [c.col + 1 for c in lay.cells])
     return lay
 

@@ -30,6 +30,9 @@ _TABS: list[str] = [
 
 _ACTION_TAB_NAME = "원본 보기"
 
+_SEARCH_W = 280       # 검색창 기본 폭
+_SEARCH_MIN_W = 100   # 창이 아주 좁을 때 줄어들 수 있는 최소 폭
+
 
 class RibbonBar(QWidget):
     searchRequested = Signal(str)
@@ -96,8 +99,17 @@ class RibbonBar(QWidget):
 
         self._tab_lay.addStretch()
 
-        # 뒤로 가기 버튼 — 검색박스 왼쪽
-        self._back_btn = QToolButton(self._tab_bar)
+        # 뒤로 가기 버튼 + 검색창 — 탭 줄 레이아웃에는 같은 폭의 빈자리만 두고, 실제 위젯은
+        # 보이는 영역 오른쪽 끝에 직접 놓는다. 창이 리본 최소 폭보다 좁아져 리본 오른쪽이
+        # 잘려도 검색창은 늘 보이게 (대신 그 아래 탭이 가려짐).
+        self._search_box = QWidget(self._tab_bar)
+        self._search_box.setObjectName("RibbonSearchBox")
+        self._search_box.setAttribute(Qt.WA_StyledBackground, True)
+        box_lay = QHBoxLayout(self._search_box)
+        box_lay.setContentsMargins(6, 0, 0, 0)
+        box_lay.setSpacing(6)
+
+        self._back_btn = QToolButton(self._search_box)
         self._back_btn.setObjectName("RibbonBack")
         self._back_btn.setText("◀")
         self._back_btn.setToolTip("뒤로 (Alt+←)")
@@ -106,17 +118,38 @@ class RibbonBar(QWidget):
         self._back_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self._back_btn.setEnabled(False)
         self._back_btn.clicked.connect(self.backRequested.emit)
-        self._tab_lay.addWidget(self._back_btn)
-        self._tab_lay.addSpacing(6)
+        box_lay.addWidget(self._back_btn)
 
-        self._search_edit = QLineEdit(self._tab_bar)
+        self._search_edit = QLineEdit(self._search_box)
         self._search_edit.setObjectName("RibbonSearch")
         self._search_edit.setPlaceholderText("🔍  검색하거나 사이트 찾기")
-        self._search_edit.setFixedWidth(280)
+        self._search_edit.setMinimumWidth(_SEARCH_MIN_W)
         self._search_edit.setFixedHeight(22)
         self._search_edit.returnPressed.connect(self._on_search_enter)
-        self._tab_lay.addWidget(self._search_edit)
-        self._tab_lay.addSpacing(8)
+        box_lay.addWidget(self._search_edit, 1)
+
+        # 넓은 창에서는 예전과 같은 자리 — 탭 줄 오른쪽 여백(8) 안쪽에 뒤로 버튼 + 280px 검색창
+        self._search_box_w = 6 + 28 + 6 + _SEARCH_W
+        self._tab_lay.addSpacing(self._search_box_w)
+        self._visible_w: int | None = None
+        self._place_search_box()
+
+    def setVisibleWidth(self, w: int) -> None:
+        """ClipBox 가 알려 주는, 화면에 실제로 보이는 리본 폭."""
+        self._visible_w = w
+        self._place_search_box()
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._place_search_box()
+
+    def _place_search_box(self) -> None:
+        bar_w = self._tab_bar.width() or self.width()
+        vis = bar_w if self._visible_w is None else min(bar_w, self._visible_w)
+        right = vis - 8
+        w = max(6 + 28 + 6 + _SEARCH_MIN_W, min(self._search_box_w, right))
+        self._search_box.setGeometry(right - w, 4, w, 22)
+        self._search_box.raise_()
 
     def _on_search_enter(self) -> None:
         text = (self._search_edit.text() if self._search_edit else "").strip()

@@ -107,8 +107,9 @@ class MainWindow(QMainWindow):
         # (id(doc), 폭, 줌, 제목) -> (doc, layout)
         self._layout_cache: dict[tuple, tuple[dict, object]] = {}
 
-        # 페이지 히스토리 — (title, doc, url) 스택. 링크 이동 시 push, 뒤로 시 pop.
-        self._history: list[tuple[str, dict, str]] = []
+        # 페이지 히스토리 — (title, doc, url, 읽던 위치) 스택. 링크 이동 시 push, 뒤로 시 pop.
+        # 읽던 위치는 _top_anchor() 의 (글자열, 비율) — 문서 안 이동(목차 등)도 한 칸씩 쌓인다.
+        self._history: list[tuple[str, dict, str, tuple[str, float] | None]] = []
 
         # 창 크기 변경 대응: ① 즉시 새 폭으로 다시 그림 (_refill_timer)
         #                  ② 잠시 뒤 페이지 자체를 새 폭으로 다시 배치해서 줄바꿈까지 맞춤
@@ -125,6 +126,7 @@ class MainWindow(QMainWindow):
         self.ribbon.openOriginalRequested.connect(self.loader.showDebugView)
         self.loader.loadStarted.connect(self._on_load_started)
         self.loader.loadProgress.connect(self._on_load_progress)
+        self.loader.pageLoaded.connect(self._on_page_loaded)
         self.loader.bodyExtracted.connect(self._on_body_extracted)
         self.loader.relayoutDone.connect(self._on_relayout_done)
         self.loader.fetchFailed.connect(self._on_fetch_failed)
@@ -217,12 +219,12 @@ class MainWindow(QMainWindow):
         """보이는 셀들에 들어갈 글자 폭을 페이지 px 로 — 이 폭으로 렌더링하면 페이지의
         한 줄이 시트의 한 행(보이는 셀들)에 들어간다.
 
-        셀 하나에는 셀 너비에서 여백을 뺀 만큼만 글자가 들어가고, 본문은 B열부터 놓으며
-        링크 등 조각마다 새 셀에서 시작하므로 A열 + 한 셀을 빼고 7% 여유를 둔다.
+        셀 하나에는 셀 너비에서 여백을 뺀 만큼만 글자가 들어가고, 본문은 A열부터 놓으며
+        링크 등 조각마다 새 셀에서 시작하므로 한 셀을 빼고 7% 여유를 둔다.
         """
         col_px = self.sheet.columnPixelWidth()
         n_cols = self.sheet.contentWidth() // max(1, col_px)
-        usable = max(1, n_cols - 2) * text_px_per_cell(col_px)
+        usable = max(1, n_cols - 1) * text_px_per_cell(col_px)
         return int(usable / self._page_scale() * PAGE_WIDTH_MARGIN)
 
     def _on_load_started(self, title: str) -> None:
@@ -237,10 +239,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{name} - Book1 - Excel")
 
     def _on_load_progress(self, p: int) -> None:
-        if p < 100:
-            self.status.setStatusText(f"로드 중… {p}%")
-        else:
-            self.status.setStatusText("렌더링 완료, 본문 추출 중…")
+        self.status.setStatusText(f"로드 중… {p}%")
+
+    def _on_page_loaded(self) -> None:
+        # 성공했을 때만 — 실패면 _on_fetch_failed 가 실패 문구를 띄운다
+        self.status.setStatusText("렌더링 완료, 본문 추출 중…")
 
     def _on_body_extracted(self, title: str, doc: dict, url: str) -> None:
         # 새 시트로 열기 — 결과는 그 시트에 저장만 하고, 보고 있던 시트는 그대로 둔다.
@@ -287,7 +290,7 @@ class MainWindow(QMainWindow):
     def _refill(self, keep_scroll: bool = False) -> None:
         if not self._last_doc:
             return
-        # 읽던 위치 — 맨 위(고정된 제목 행 바로 아래)에 보이던 글자열 + 문서 안 위치 비율.
+        # 읽던 위치 — 맨 위에 보이던 글자열 + 문서 안 위치 비율.
         # 다시 배치하면 줄바꿈이 달라지므로 행 번호가 아니라 글자열로 같은 곳을 찾는다.
         anchor = self._top_anchor() if keep_scroll else None
         view_w = self.sheet.contentWidth()
@@ -313,8 +316,7 @@ class MainWindow(QMainWindow):
         if anchor is not None:
             row = _find_anchor_row(lay, *anchor)
             if row > 0:
-                # 고정된 제목 행에 가리지 않게 한 줄 위를 맨 위로
-                self.sheet.scrollTo(self.sheet.model().index(max(0, row - 1), 0),
+                self.sheet.scrollTo(self.sheet.model().index(row, 0),
                                     QAbstractItemView.ScrollHint.PositionAtTop)
         tokens = self._last_doc.get("tokens") or []
         n_img = sum(1 for t in tokens if isinstance(t, dict) and t.get("t") == "i" and t.get("src"))
@@ -326,7 +328,7 @@ class MainWindow(QMainWindow):
         lay = self._cur_layout
         if lay is None:
             return None
-        first = max(1, self.sheet.rowAt(self.sheet.rowHeight(0)))
+        first = max(0, self.sheet.rowAt(0))
         stream, starts = _text_stream(lay)
         for i, (row, _off) in enumerate(starts):
             if row >= first:
@@ -443,6 +445,8 @@ class MainWindow(QMainWindow):
         self._current_sheet = idx
         info = self._sheets.get(idx, {"type": "namu"})
         kind = info.get("type", "namu")
+        # 위장 시트만 머리글 행 고정 — 나무위키 시트의 제목 행은 스크롤과 함께 움직인다
+        self.sheet.setFrozenTopRow(kind != "namu")
 
         if kind == "decoy2":
             saved = decoystore.load()
@@ -478,7 +482,7 @@ class MainWindow(QMainWindow):
             # 떠난 뒤 창 크기가 바뀌어 배치가 달라짐 — 글자열로 읽던 곳 찾기
             row = _find_anchor_row(self._cur_layout, *anchor)
             if row > 0:
-                self.sheet.scrollTo(self.sheet.model().index(max(0, row - 1), 0),
+                self.sheet.scrollTo(self.sheet.model().index(row, 0),
                                     QAbstractItemView.ScrollHint.PositionAtTop)
         else:
             self.sheet.verticalScrollBar().setValue(sv)
@@ -531,6 +535,11 @@ class MainWindow(QMainWindow):
         """우클릭 → '새 시트로 열기'. 새 sheet 탭 만들고 거기에 로드."""
         if not href:
             return
+        if href.startswith("#"):
+            # 페이지 안 링크 — 새 시트에는 이 문서를 불러온다
+            if not self._last_url:
+                return
+            href = self._last_url.split("#", 1)[0] + href
         new_idx = self.tabs.addSheet()
         self._sheets[new_idx] = {"type": "namu", "doc": {}, "title": href, "url": ""}
         # 진행 중이던 현재 시트 로드는 취소됨 (로더가 하나)
@@ -621,12 +630,34 @@ class MainWindow(QMainWindow):
         dlg = ImageDialog(url, label, self)
         dlg.exec()
 
+    def _push_history(self) -> None:
+        if self._last_doc:
+            at_top = self.sheet.verticalScrollBar().value() == 0
+            self._history.append((self._last_title, self._last_doc, self._last_url,
+                                  None if at_top else self._top_anchor()))
+            self.ribbon.setBackEnabled(True)
+
+    def _scroll_to_row(self, row: int) -> None:
+        self.sheet.scrollTo(self.sheet.model().index(row, 0),
+                            QAbstractItemView.ScrollHint.PositionAtTop)
+
+    def _jump_in_page(self, anchor_id: str) -> None:
+        """목차 숫자 등 페이지 안 링크 — 다시 불러오지 않고 그 위치의 행으로 스크롤."""
+        lay = self._cur_layout
+        row = lay.anchors.get(anchor_id) if lay is not None else None
+        if row is None:
+            self.status.setStatusText("이동할 위치를 찾지 못했습니다")
+            return
+        self._push_history()
+        self._scroll_to_row(row)
+
     def _on_link_cell(self, href: str) -> None:
         if not href:
             return
-        if self._last_doc:
-            self._history.append((self._last_title, self._last_doc, self._last_url))
-            self.ribbon.setBackEnabled(True)
+        if href.startswith("#"):
+            self._jump_in_page(href[1:])
+            return
+        self._push_history()
         # search_edit / 윈도우 타이틀은 loadStarted 에서 추출 title 로 반영
         self._on_search(href)
 
@@ -634,12 +665,20 @@ class MainWindow(QMainWindow):
         if not self._history:
             self.status.setStatusText("뒤로 갈 페이지가 없습니다")
             return
-        title, doc, url = self._history.pop()
-        self._show_namu(title, doc, url)
+        title, doc, url, anchor = self._history.pop()
+        if url != self._last_url or not self._last_doc:
+            self._show_namu(title, doc, url)
+        # 이동하기 전에 보던 곳으로 (맨 위였으면 맨 위로)
+        if anchor is None:
+            self.sheet.verticalScrollBar().setValue(0)
+        elif self._cur_layout is not None:
+            row = _find_anchor_row(self._cur_layout, *anchor)
+            if row >= 0:
+                self._scroll_to_row(row)
         # 뒤로 간 결과도 현재 시트에 보존 (시트 전환 후 돌아와도 유지)
         cur = self._sheets.get(self._current_sheet)
         if cur is not None and cur.get("type") == "namu":
-            cur.update({"doc": doc, "title": title, "url": url})
+            cur.update({"doc": self._last_doc, "title": self._last_title, "url": self._last_url})
         self._update_window_title()
         self.ribbon.setBackEnabled(bool(self._history))
 

@@ -38,6 +38,10 @@ class ClipBox(QScrollArea):
         w = max(self.viewport().width(), min_w)
         if content.width() != w or content.height() != self.height():
             content.resize(w, self.height())
+        # 실제로 보이는 폭을 알려 줌 — 잘리는 쪽에 있어도 늘 보여야 하는 것(검색창)을 옮기도록
+        set_visible = getattr(content, "setVisibleWidth", None)
+        if set_visible is not None:
+            set_visible(self.viewport().width())
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)

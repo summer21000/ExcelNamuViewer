@@ -14,7 +14,7 @@ QMainWindow, QWidget {
     background: #ffffff;
     border-bottom: 1px solid #d1d1d1;
 }
-#RibbonTabBar {
+#RibbonTabBar, #RibbonSearchBox {
     background: #ffffff;
 }
 QToolButton#RibbonTab {

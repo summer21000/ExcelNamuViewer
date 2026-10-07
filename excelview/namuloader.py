@@ -62,6 +62,8 @@ JSON.stringify((function() {
   // styles: 셀 서식으로 옮길 것만 (굵게/기울임/취소선). 글자 크기·색·배경은 옮기지 않는다
   //         — 엑셀처럼 보이는 것이 우선.
   var tokens = [], styles = [], styleIdx = {}, nBlocks = 0;
+  // 같은 페이지 안에서 이동하는 링크(목차 숫자 ↔ 문단 제목 숫자 등)의 대상 id
+  var jumpIds = {};
   var range = document.createRange();
 
   function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
@@ -116,15 +118,25 @@ JSON.stringify((function() {
     return cx >= clip.l - 1 && cx <= clip.r + 1 && cy >= clip.t - 1 && cy <= clip.b + 1;
   }
 
-  // 각주 anchor: href 가 in-page #anchor 이면 그 target 또는 부모 컨테이너의 텍스트 추출.
+  // 링크가 지금 페이지 안의 #id 를 가리키면 그 id, 아니면 null.
+  function samePageId(a) {
+    var raw = a.getAttribute('href') || '';
+    var hash = null;
+    if (raw.charAt(0) === '#') hash = raw.substring(1);
+    else {
+      try {
+        var u = new URL(a.href);
+        if (u.origin === location.origin && u.pathname === location.pathname &&
+            u.search === location.search && u.hash.length > 1) hash = u.hash.substring(1);
+      } catch (e) {}
+    }
+    if (!hash) return null;
+    try { return decodeURIComponent(hash); } catch (e) { return hash; }
+  }
+
+  // 각주 anchor: 그 target 또는 부모 컨테이너의 텍스트 추출.
   // namu.wiki 는 <span id="fn-N"></span> 빈 anchor + 부모 span 에 각주 본문 텍스트.
-  function resolveFootnote(href) {
-    if (!href) return null;
-    var hashIdx = href.indexOf('#');
-    if (hashIdx < 0) return null;
-    var id;
-    try { id = decodeURIComponent(href.substring(hashIdx + 1)); }
-    catch (e) { id = href.substring(hashIdx + 1); }
+  function resolveFootnote(id) {
     if (!id) return null;
     var target = document.getElementById(id);
     if (!target) return null;
@@ -375,9 +387,14 @@ JSON.stringify((function() {
       if (c.nodeName === 'A') {
         var h = c.getAttribute('href') || '';
         try { if (h && c.href) h = c.href; } catch (e) {}
-        var fn = resolveFootnote(h);
-        if (fn) { n.fn = fn; n.href = null; }
-        else if (h && !/^javascript:/i.test(h)) n.href = h;
+        var pid = samePageId(c);
+        if (pid !== null) {
+          // 각주(#fn-N)는 내용을 보여 주고, 그 밖의 페이지 안 링크(목차 #s-N, #toc,
+          // 각주 목록의 #rfn-N 등)는 시트 안에서 그 위치로 이동 — href 를 "#id" 로 남김
+          var fn = /^fn-/.test(pid) ? resolveFootnote(pid) : null;
+          if (fn) { n.fn = fn; n.href = null; }
+          else if (document.getElementById(pid)) { n.href = '#' + pid; jumpIds[pid] = 1; }
+        } else if (h && !/^javascript:/i.test(h)) n.href = h;
       }
       walk(c, n);
     }
@@ -398,9 +415,19 @@ JSON.stringify((function() {
     var root = contentRoot();
     walk(root, {href: null, fn: null, clip: null, blk: -1,
                 st: styleOf(window.getComputedStyle(root), {}), strike: 0});
+    // 이동 대상의 페이지 y 좌표 — 시트에서는 이 높이의 행으로 이동
+    var anchors = {};
+    for (var jid in jumpIds) {
+      var el = document.getElementById(jid);
+      if (!el) continue;
+      var er = el.getBoundingClientRect();
+      if (er.width === 0 && er.height === 0 && el.parentElement)
+        er = el.parentElement.getBoundingClientRect();
+      anchors[jid] = Math.round(er.top + sy);
+    }
     return {
       ok: true, sel: root === document.body ? 'body' : 'content',
-      tokens: tokens, styles: styles,
+      tokens: tokens, styles: styles, anchors: anchors,
       pageW: pageW, pageH: pageH,
       title: document.title, url: location.href
     };
@@ -416,6 +443,7 @@ class NamuLoader(QObject):
 
     loadStarted = Signal(str)
     loadProgress = Signal(int)
+    pageLoaded = Signal()  # 페이지 로드 성공 (본문 추출은 이제 시작)
     # title, doc (tokens/styles/pageW/pageH — namuformatter 입력), source_url
     bodyExtracted = Signal(str, dict, str)
     # 창 크기 변경으로 같은 페이지를 새 폭으로 다시 배치해서 읽은 결과: source_url, doc
@@ -437,8 +465,8 @@ class NamuLoader(QObject):
         s.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
 
         self._page = QWebEnginePage(profile, self)
-        self._page.loadStarted.connect(lambda: self.loadProgress.emit(0))
-        self._page.loadProgress.connect(self.loadProgress.emit)
+        self._page.loadStarted.connect(self._on_page_load_started)
+        self._page.loadProgress.connect(self._on_progress)
         self._page.loadFinished.connect(self._on_loaded)
 
         # hidden view 로 viewport 확보 — layout 계산 (getBoundingClientRect) 이 동작하려면
@@ -453,6 +481,9 @@ class NamuLoader(QObject):
         self._current_url = ""
         self._gen = 0  # fetch 세대 — 이전 로드의 지연 추출 타이머가 새 페이지에 끼어들지 않게
         self._page_ready = False  # 현재 페이지 추출까지 끝났는지 (다시 배치 가능 여부)
+        # 페이지 로드가 아직 안 끝났는지 — 끝난 뒤(실패 포함) 늦게 오는 진행률이
+        # 상태 표시줄의 실패 문구를 "렌더링 완료" 로 덮지 않게 진행률은 이때만 전달
+        self._loading = False
         self._relayout_gen = 0
         self._extract_attempts = 0
         self._max_attempts = 4
@@ -588,13 +619,25 @@ class NamuLoader(QObject):
         self._page_ready = False
         self._relayout_gen += 1   # 진행 중이던 다시 배치는 무효
         self._extract_attempts = 0
+        self._loading = True
         self.loadStarted.emit(self._current_title)
         self._page.load(qurl)
 
+    def _on_progress(self, p: int) -> None:
+        # 100% 는 보내지 않는다 — 실패해도 100% 가 오므로 성공 여부는 loadFinished 로만 판단
+        if self._loading and p < 100:
+            self.loadProgress.emit(p)
+
+    def _on_page_load_started(self) -> None:
+        self._loading = True
+        self.loadProgress.emit(0)
+
     def _on_loaded(self, ok: bool) -> None:
+        self._loading = False
         if not ok:
-            self.fetchFailed.emit(self._current_title, "페이지 로드 실패")
+            self.fetchFailed.emit(self._current_title, "페이지를 불러오지 못했습니다")
             return
+        self.pageLoaded.emit()
         gen = self._gen
         QTimer.singleShot(self._extract_delay_ms, lambda: self._run_extract(gen))
 
@@ -635,6 +678,7 @@ class NamuLoader(QObject):
         return {
             "tokens": info.get("tokens") or [],
             "styles": info.get("styles") or [],
+            "anchors": info.get("anchors") or {},
             "pageW": int(info.get("pageW") or 1280),
             "pageH": int(info.get("pageH") or 800),
             # 이 문서를 렌더링한 폭 — 창 크기와 다르면 다시 배치 대상
