@@ -50,6 +50,11 @@ def main() -> int:
     app.setFont(QFont("Malgun Gothic", 9))
     _load_stylesheet(app)
 
+    # 실행 비밀번호 — 맞아야 창이 뜬다 (즐겨찾기 암호도 이걸로 풀림). 취소하면 종료
+    from excelview.passworddialog import ask_password
+    if not ask_password():
+        return 0
+
     win = MainWindow()
     win.show()
     return app.exec()

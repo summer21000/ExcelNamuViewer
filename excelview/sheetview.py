@@ -32,12 +32,45 @@ def cell_address(row: int, col: int) -> str:
     return f"{column_letter(col)}{row + 1}"
 
 
+def link_title(href: str) -> str:
+    """링크 셀 툴팁 — 나무위키처럼 이동할 문서의 제목을 보여준다.
+
+    /w/문서#s-2 처럼 문단까지 가리키면 "문서#s-2", 페이지 안 링크는 안내 문구,
+    나무위키 밖 주소는 읽을 수 있게 디코드한 주소 그대로.
+    """
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    href = str(href or "")
+    if href.startswith("#"):
+        return "이 문서 안에서 이동"
+    try:
+        u = urlparse(href)
+    except Exception:
+        return href
+    host = (u.netloc or "").lower()
+    if not host or host == "namu.wiki" or host.endswith(".namu.wiki"):
+        path = u.path or ""
+        if path.startswith("/w/"):
+            title = unquote(path[3:])
+            frag = unquote(u.fragment) if u.fragment else ""
+            return f"{title}#{frag}" if frag else title
+        if path.startswith(("/Go", "/Search")):
+            q = (parse_qs(u.query).get("q") or [""])[0]
+            if q:
+                return q
+    try:
+        return unquote(href)
+    except Exception:
+        return href
+
+
 class SheetView(QTableView):
     cellSelected = Signal(int, int, str, str)
     cellEdited = Signal()                    # 셀 편집 (모델 itemChanged) — clearAll 후에도 살아남음
     imageCellActivated = Signal(str, str)   # url, alt_or_label
     linkCellActivated = Signal(str)         # href — 같은 시트에서 열기 (더블클릭 / 메뉴 "열기")
     linkOpenInNewSheet = Signal(str)        # href — 새 시트에서 열기
+    linkAddFavorite = Signal(str)           # href — 즐겨찾기에 추가
     visibleColsChanged = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -121,7 +154,7 @@ class SheetView(QTableView):
             f = item.font()
             f.setUnderline(True)
             item.setFont(f)
-            item.setToolTip(f"더블 클릭하면 이동: {link_url}")
+            item.setToolTip(link_title(link_url))
             item.setEditable(False)
 
         if footnote:
@@ -410,8 +443,12 @@ class SheetView(QTableView):
         act_new = QAction("새 시트로 열기", menu)
         act_open.triggered.connect(lambda: self.linkCellActivated.emit(link))
         act_new.triggered.connect(lambda: self.linkOpenInNewSheet.emit(link))
+        act_fav = QAction("즐겨찾기에 추가", menu)
+        act_fav.triggered.connect(lambda: self.linkAddFavorite.emit(link))
         menu.addAction(act_open)
         menu.addAction(act_new)
+        menu.addSeparator()
+        menu.addAction(act_fav)
         menu.exec(self.viewport().mapToGlobal(pos))
 
     def _on_single_clicked(self, idx) -> None:

@@ -8,12 +8,13 @@
 
 > **소스 빌드 / Python 설치 없이 즉시 사용할 수 있습니다.**
 >
-> **[GitHub Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest)** 에서 최신 `ExcelView.exe` (≈245 MB) 를 다운로드 → **더블클릭만 하면 실행**
+> **[GitHub Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest)** 에서 최신 `ExcelView.zip` 을 다운로드 → **압축을 모두 푼 뒤** `ExcelView\ExcelView.exe` 실행
 >
 > - Windows 10 / 11 (64bit) 에서 바로 동작
-> - Python, pip, git clone 모두 불필요 — 단일 실행 파일
+> - Python, pip, git clone 모두 불필요
+> - ⚠ zip 안에서 바로 실행하면 동작하지 않습니다 — `ExcelView.exe` 옆의 `_internal` 폴더가 함께 있어야 합니다
 >
-> ⏳ **첫 실행은 10~20초 정도 화면이 안 뜰 수 있습니다.** `--onefile` 압축 해제 + Qt WebEngine 초기화에 시간이 걸립니다. 두 번째 실행부터는 빠릅니다.
+> ⏳ 컴퓨터에서 처음 실행할 때는 몇 초 더 걸릴 수 있고, 이후엔 2~3초 안에 뜹니다.
 
 ---
 
@@ -29,7 +30,16 @@
 - 이미지는 셀에 `[사진보기]` placeholder 로 표시 → 더블 클릭 시 별창에 사진 표시
 - 인라인 링크 더블 클릭으로 이동 + 우클릭 → "새 시트로 열기" 지원
 - 각주 `[1]`, `[2]` 셀 단일 클릭 시 toolTip 으로 본문 표시
-- 광고 컨테이너 자동 차단
+- 광고 컨테이너 자동 차단 + 광고·추적 요청 차단 + 본문 사이 텍스트 광고(파워링크) 제거 (나무위키에서만)
+- 링크 셀에 커서를 올리면 이동할 문서 제목 표시
+- 여러 시트에서 동시에 불러와도 서로 끊기지 않음 (로드마다 숨은 브라우저 페이지가 따로)
+- 페이지가 준비되는 즉시 본문을 읽음 (고정 대기 없음). 사진은 `[사진보기]` 를 누를 때만 내려받음
+- 나무위키 틀의 접힌 탭/접기 상자는 제목만 표시 (숨은 내용이 본문과 겹치지 않음)
+- **즐겨찾기** — 리본 우상단 `☆` 버튼 (현재 주소 추가/제거, 목록에서 열기·삭제), 링크 우클릭 → "즐겨찾기에 추가".
+  저장 파일(`ExcelViewAPPDATA\favorites.dat`)은 암호화되어 다른 프로그램으로 열면 내용을 알아볼 수 없음
+- **실행 비밀번호** — 처음 실행 시 지정, 이후 실행할 때마다 확인 (엑셀 "암호" 창 모양).
+  비밀번호는 해시로만 저장. 잊었으면 `ExcelViewAPPDATA\auth.json` 을 지우고 다시 지정
+- 한/영 입력 상태는 직전에 쓰던 프로그램을 따라감
 - 창 크기 변경(특히 축소)에 맞춰 다시 배치 — 브라우저처럼 줄바꿈 위치가 새 폭에 맞게 바뀜
   - 바꾸는 즉시 새 폭으로 다시 그리고, 크기 조절이 멈추면 페이지 자체를 새 폭으로 다시 배치해 줄바꿈까지 맞춤
   - 다시 배치해도 읽던 문단 위치 유지 (다른 시트에 다녀온 뒤에도)
@@ -61,33 +71,33 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## 단일 .exe 로 빌드
+## 실행 파일로 빌드
 
 ```cmd
 .venv\Scripts\pip install -r requirements-build.txt
 .venv\Scripts\pyinstaller --noconfirm ExcelView.spec
 ```
 
-→ `dist\ExcelView.exe` (약 245MB, self-contained).
-다른 PC 에서도 그 .exe 하나만 더블클릭하면 동작 (Windows 10/11 x64).
+→ `dist\ExcelView\` 폴더 (`ExcelView.exe` + `_internal`). 폴더째 옮기면 다른 PC 에서도 동작 (Windows 10/11 x64).
 
-> ⏳ 빌드된 `.exe` 의 **첫 실행은 10~20초** 정도 걸립니다 (`--onefile` 압축 해제 + Qt WebEngine 초기화). 두 번째 실행부터는 빨라집니다.
+> 폴더형(onedir) 빌드 — 단일 파일(onefile)은 실행할 때마다 압축을 풀어 시작에 15초 넘게 걸려서 바꿨습니다.
 
 ## 사용법
 
-> **빌드 없이 즉시 쓰고 싶다면** → [Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest) 에서 `ExcelView.exe` 다운로드 → 더블클릭.
-> ⏳ 첫 실행은 압축 해제 + Qt WebEngine 초기화로 **10~20초** 정도 검은 화면일 수 있습니다.
+> **빌드 없이 즉시 쓰고 싶다면** → [Releases 페이지](https://github.com/summer21000/ExcelNamuViewer/releases/latest) 에서 `ExcelView.zip` 다운로드 → 압축 풀고 `ExcelView.exe` 실행.
 
+0. 실행하면 비밀번호 창이 먼저 뜸 (처음이면 비밀번호 지정).
 1. 실행하면 **Sheet1 (위장 시트)** 가 먼저 보임. 일하는 척 하기 좋은 빈 양식이 떠있음.
 2. 본격 사용하려면 우상단 검색박스에 나무위키 문서 제목 입력 + Enter
    - 예: `악어`, `리누스 토르발스`, `Qt` — 띄어쓰기는 정확하지 않아도 됨
    - 일반 URL (`https://...`) / 로컬 파일 경로도 그대로 입력 가능
-3. 자동으로 Sheet2 (작업 영역) 로 전환 + 페이지 로드 (약 5초)
+3. 자동으로 Sheet2 (작업 영역) 로 전환 + 페이지 로드 (보통 수 초)
 4. 셀 동작
    - **파란 밑줄 셀** = 링크 → **더블클릭**해서 이동 / **우클릭 → 새 시트로 열기**
      (새 시트는 뒤에서 로드되고, 보고 있던 시트는 그대로 유지 — 시트 탭을 눌러서 이동)
    - **회색 밑줄 `[N]`** = 각주 → **단일클릭**해서 toolTip
    - **`[사진보기]` 셀** = 이미지 → **더블클릭**해서 사진 팝업
+   - 링크 **우클릭 → 즐겨찾기에 추가**, 리본 우상단 **`☆`** 로 즐겨찾기 열기
 
 ### 위장 모드 (사무실 생존)
 
@@ -132,6 +142,10 @@ ExcelView/
 │   ├── namuformatter.py    # positioned tokens → 셀 레이아웃 (줄 묶기, 열 위치, 셀 너비만큼 잘라 이어 쓰기)
 │   ├── clipbox.py          # 창을 최소 폭보다 좁히면 리본/상태 표시줄 오른쪽을 가리는 상자
 │   ├── imagedialog.py      # 이미지 미리보기 (520x400 고정)
+│   ├── favorites.py        # 즐겨찾기 (암호화 저장)
+│   ├── securestore.py      # 실행 비밀번호 해시 + 로컬 파일 암호화
+│   ├── passworddialog.py   # 실행 비밀번호 창
+│   ├── imestate.py         # 한/영 상태를 시스템에 맞춤
 │   └── decoysheets.py      # 위장 시트 데이터
 ├── resources/excel.qss     # 엑셀 룩 스타일시트
 ├── ExcelView.spec          # PyInstaller 빌드 spec

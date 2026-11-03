@@ -2,18 +2,19 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
-from PySide6.QtWidgets import QAbstractItemView, QMainWindow, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QAbstractItemView, QMainWindow, QMenu, QVBoxLayout, QWidget
 
-from excelview import decoystore
+from excelview import decoystore, favorites
 from excelview.clipbox import ClipBox
 from excelview.decoysheets import decoy_sheet2, decoy_sheet3
 from excelview.formulabar import FormulaBar
 from excelview.imagedialog import ImageDialog
+from excelview.imestate import ImeStateSync
 from excelview.namuformatter import format_document, text_px_per_cell
 from excelview.namuloader import NamuLoader
 from excelview.ribbonbar import RibbonBar
 from excelview.sheettabbar import SheetTabBar
-from excelview.sheetview import SheetView
+from excelview.sheetview import SheetView, link_title
 from excelview.statusbar import ExcelStatusBar
 
 
@@ -91,6 +92,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.loader = NamuLoader(self)
+        # 한/영 상태는 시스템(직전에 쓰던 프로그램)을 따라간다 — 영문 고정으로 시작하지 않게
+        self._ime_sync = ImeStateSync(self)
 
         self._last_diag: dict = {}
         self._last_title: str = ""
@@ -101,8 +104,12 @@ class MainWindow(QMainWindow):
         self._last_layout_rows: int = 0
         self._cur_layout = None   # 지금 그려진 SheetLayout (읽던 위치 찾기용)
         self._zoom: int = 100
-        # 다음 _show_namu 에서 읽던 위치를 유지할지 (창 크기 때문에 다시 불러온 경우)
-        self._keep_scroll_next = False
+        # 진행 중인 로드 요청 — 요청 번호(rid) -> {"sheet": 결과를 받을 시트 dict,
+        # "bg": 새 시트로 열기(백그라운드), "keep": 읽던 위치 유지(창 크기 때문에 다시 불러옴)}.
+        # 시트는 번호가 아니라 dict 자체로 가리킨다 — 탭을 닫아 번호가 당겨져도 그대로 맞음.
+        # 로드마다 브라우저 페이지가 따로라서 여러 시트가 동시에 불러와도 서로 끊지 않는다.
+        self._requests: dict[int, dict] = {}
+        self._diags: dict[int, dict] = {}
         # 계산한 셀 레이아웃 캐시 — 시트를 오갈 때 큰 문서도 다시 계산하지 않게.
         # (id(doc), 폭, 줌, 제목) -> (doc, layout)
         self._layout_cache: dict[tuple, tuple[dict, object]] = {}
@@ -124,7 +131,6 @@ class MainWindow(QMainWindow):
         self.ribbon.searchRequested.connect(self._on_search)
         self.ribbon.backRequested.connect(self._go_back)
         self.ribbon.openOriginalRequested.connect(self.loader.showDebugView)
-        self.loader.loadStarted.connect(self._on_load_started)
         self.loader.loadProgress.connect(self._on_load_progress)
         self.loader.pageLoaded.connect(self._on_page_loaded)
         self.loader.bodyExtracted.connect(self._on_body_extracted)
@@ -136,6 +142,8 @@ class MainWindow(QMainWindow):
         self.sheet.imageCellActivated.connect(self._on_image_cell)
         self.sheet.linkCellActivated.connect(self._on_link_cell)
         self.sheet.linkOpenInNewSheet.connect(self._on_link_cell_new_sheet)
+        self.sheet.linkAddFavorite.connect(self._on_link_add_favorite)
+        self.ribbon.favoritesRequested.connect(self._show_favorites_menu)
         self.sheet.visibleColsChanged.connect(self._on_visible_cols)
         self.tabs.sheetChanged.connect(self._on_sheet_changed)
         self.tabs.newSheetRequested.connect(self._on_new_sheet)
@@ -149,10 +157,6 @@ class MainWindow(QMainWindow):
             1: {"type": "namu", "doc": {}, "title": "", "url": ""},
         }
         self._current_sheet = 0
-        self._pending_new_sheet: int | None = None
-        # 로드를 시작한 namu 시트 — 비동기 추출 도중 다른 시트(위장 포함)로
-        # 이동해도 결과는 항상 이 시트에 들어간다.
-        self._loading_sheet: int | None = None
         self._decoy_dirty = False  # 사용자 편집 후만 True — 빈 모델로 저장 덮어쓰는 사고 방지
         self.sheet.setFrozenTopRow(True)
         # 셀 편집 추적 — sheet 자체 signal 이라 clearAll 후에도 살아남음
@@ -195,21 +199,57 @@ class MainWindow(QMainWindow):
         self.tabs.selectSheet(new_idx)
 
     def _on_search(self, title: str) -> None:
-        # 검색창/링크로 현재 시트에 여는 로드 — 진행 중이던 "새 시트로 열기" 로드는
-        # (로더가 하나라) 여기서 취소된다. 결과가 엉뚱한 새 시트로 가지 않게 해제.
-        self._pending_new_sheet = None
+        # 검색창/링크로 현재 시트에 여는 로드. 로드를 시작한 시트가 결과를 받는다
+        # (도중에 다른 시트로 이동해도 / 위장으로 숨어도). 다른 시트의 로드는 그대로 진행.
         self._ensure_namu_sheet_active()
-        # 로드를 시작한 시트를 고정 — 추출 완료 시 현재 시트가 아니라
-        # 이 시트가 결과를 받는다 (다른 시트로 이동해도 / 위장으로 숨어도).
-        self._loading_sheet = self._current_sheet
-        self._fetch(title)
+        self._start_load(self._current_sheet, title)
 
-    def _fetch(self, title: str) -> None:
-        self.status.setStatusText(f"'{title}' 로드 중...")
-        if self._pending_new_sheet is None:
-            self.status.setSummary("")
+    def _sheet_index(self, info: dict) -> int | None:
+        for k, v in self._sheets.items():
+            if v is info:
+                return k
+        return None
+
+    def _cancel_sheet_load(self, info: dict) -> None:
+        rid = info.pop("req", None)
+        if rid is not None:
+            self._requests.pop(rid, None)
+            self._diags.pop(rid, None)
+            self.loader.cancel(rid)
+
+    def _start_load(self, idx: int, target: str, background: bool = False,
+                    keep_scroll: bool = False, status: str | None = None) -> None:
+        """시트 idx 에 target 을 불러온다. 그 시트에서 진행 중이던 로드는 취소(새 것이 이김)."""
+        info = self._sheets[idx]
+        self._cancel_sheet_load(info)
         self.loader.setPageWidth(self._page_css_width())
-        self.loader.fetch(title)
+        rid, title = self.loader.fetch(target)
+        info["req"] = rid
+        self._requests[rid] = {"sheet": info, "bg": background, "keep": keep_scroll}
+        self.status.setStatusText(status or f"'{title}' 로드 중...")
+        if idx == self._current_sheet:
+            self.status.setSummary("")
+            self.ribbon.search_edit.setText(title)
+            # 윈도우 타이틀은 sheet 이름 기준 (문서 제목 노출 안 함)
+            self._update_window_title()
+
+    def _request_is_current(self, rid: int) -> bool:
+        """이 요청의 결과를 받을 시트를 지금 보고 있는지."""
+        req = self._requests.get(rid)
+        return req is not None and req["sheet"] is self._sheets.get(self._current_sheet)
+
+    def _take_request(self, rid: int) -> tuple[dict | None, int | None, dict | None]:
+        """끝난 요청을 목록에서 빼고 (요청, 시트 번호, 시트 dict). 시트가 닫혔으면 번호 None."""
+        req = self._requests.pop(rid, None)
+        if req is None:
+            return None, None, None
+        info = req["sheet"]
+        if info.get("req") == rid:
+            info.pop("req", None)
+        idx = self._sheet_index(info)
+        if idx is None or info.get("type") != "namu":
+            return req, None, None
+        return req, idx, info
 
     def _page_scale(self) -> float:
         """페이지 px → 시트 px. 셀 글꼴 / 페이지 본문 글꼴 — 이래야 글자 폭이 맞는다 (줌 포함)."""
@@ -227,63 +267,50 @@ class MainWindow(QMainWindow):
         usable = max(1, n_cols - 1) * text_px_per_cell(col_px)
         return int(usable / self._page_scale() * PAGE_WIDTH_MARGIN)
 
-    def _on_load_started(self, title: str) -> None:
-        if self._pending_new_sheet is not None:
-            return  # 백그라운드 새 시트 로드 — 지금 보고 있는 시트의 검색창은 그대로
-        self.ribbon.search_edit.setText(title)
-        # 윈도우 타이틀은 sheet 이름 기준 (문서 제목 노출 안 함)
-        self._update_window_title()
-
     def _update_window_title(self) -> None:
         name = self.tabs.sheetName(self._current_sheet)
         self.setWindowTitle(f"{name} - Book1 - Excel")
 
-    def _on_load_progress(self, p: int) -> None:
-        self.status.setStatusText(f"로드 중… {p}%")
+    def _on_load_progress(self, rid: int, p: int) -> None:
+        # 보고 있는 시트의 로드만 상태 표시줄에 — 다른 시트의 진행률이 섞이지 않게
+        if self._request_is_current(rid):
+            self.status.setStatusText(f"로드 중… {p}%")
 
-    def _on_page_loaded(self) -> None:
+    def _on_page_loaded(self, rid: int) -> None:
         # 성공했을 때만 — 실패면 _on_fetch_failed 가 실패 문구를 띄운다
-        self.status.setStatusText("렌더링 완료, 본문 추출 중…")
+        if self._request_is_current(rid):
+            self.status.setStatusText("렌더링 완료, 본문 추출 중…")
 
-    def _on_body_extracted(self, title: str, doc: dict, url: str) -> None:
-        # 새 시트로 열기 — 결과는 그 시트에 저장만 하고, 보고 있던 시트는 그대로 둔다.
-        # (사용자가 직접 그 탭을 눌러야 이동. 이미 그 탭을 보고 있으면 바로 그림)
-        if self._pending_new_sheet is not None:
-            target = self._pending_new_sheet
-            self._pending_new_sheet = None
-            if self._sheets.get(target, {}).get("type") != "namu":
-                return
-            self._sheets[target] = {"type": "namu", "doc": doc, "title": title, "url": url}
-            if self._current_sheet == target:
-                self._show_namu(title, doc, url)
-            else:
-                self.status.setStatusText(f"{self.tabs.sheetName(target)} 준비됨")
-            return
-
+    def _on_body_extracted(self, rid: int, title: str, doc: dict, url: str) -> None:
         # 로드를 시작한 시트(= 브라우저 탭)에 저장 — 도중 다른 시트로 이동했어도
         # 그 시트가 받는다. 시작 시트가 닫혔으면(로딩 중 탭 닫기 = 취소) 결과 폐기.
-        target = self._loading_sheet
-        self._loading_sheet = None
-        if target is None or self._sheets.get(target, {}).get("type") != "namu":
-            self.status.setStatusText("준비")
+        req, idx, info = self._take_request(rid)
+        self._diags.pop(rid, None)
+        if req is None or info is None:
             return
-        self._sheets[target] = {"type": "namu", "doc": doc, "title": title, "url": url}
-        # 현재 보고 있는 시트가 target 일 때만 화면 갱신. 아니면 조용히 저장만 —
+        info.update({"doc": doc, "title": title, "url": url})
+        # 이전 문서의 스크롤 위치는 새 문서에 맞지 않음
+        for k in ("scroll_v", "scroll_h", "anchor", "anchor_w"):
+            info.pop(k, None)
+        # 현재 보고 있는 시트일 때만 화면 갱신. 아니면 조용히 저장만 —
         # 사용자가 이동한 시트/위장 시트를 함부로 전환하지 않는다(위장 보호).
-        if self._current_sheet == target:
-            self._show_namu(title, doc, url)
-        else:
+        # (새 시트로 열기도 사용자가 직접 그 탭을 눌러야 이동)
+        if idx == self._current_sheet:
+            self._show_namu(title, doc, url, keep_scroll=req["keep"])
+        elif req["bg"]:
+            self.status.setStatusText(f"{self.tabs.sheetName(idx)} 준비됨")
+        elif "req" not in self._sheets.get(self._current_sheet, {}):
             # 백그라운드 시트에 저장 완료 — "로드 중…" 상태 문구만 정리.
             self.status.setStatusText("준비")
 
-    def _show_namu(self, title: str, doc: dict, url: str) -> None:
-        keep = self._keep_scroll_next and url == self._last_url
-        self._keep_scroll_next = False
+    def _show_namu(self, title: str, doc: dict, url: str, keep_scroll: bool = False) -> None:
+        keep = keep_scroll and url == self._last_url
         self._last_title = title
         self._last_doc = doc
         self._last_url = url
         self._refill(keep_scroll=keep)
         self.ribbon.search_edit.setText(title)
+        self._update_favorite_mark()
         # 다른 폭에서 렌더링된 문서(창 크기를 바꾼 뒤 시트 전환/뒤로 가기 등)면 다시 배치
         self._schedule_relayout_if_needed()
 
@@ -357,8 +384,8 @@ class MainWindow(QMainWindow):
         info = self._sheets.get(self._current_sheet, {})
         if info.get("type") != "namu" or not self._last_doc or not self._last_url:
             return
-        if self._loading_sheet is not None or self._pending_new_sheet is not None:
-            return  # 다른 로드 진행 중 — 끝나고 보여줄 때 다시 확인됨
+        if info.get("req") is not None:
+            return  # 이 시트가 새 문서를 불러오는 중 — 끝나고 보여줄 때 다시 확인됨
         want = self._page_css_width()
         if abs(int(self._last_doc.get("renderW") or 0) - want) <= 16:
             return
@@ -368,11 +395,8 @@ class MainWindow(QMainWindow):
                 self.status.setStatusText("창 크기에 맞춰 다시 배치 중…")
             return
         # 다른 문서가 열려 있음 — 이 문서를 새 폭으로 다시 불러온다 (읽던 위치 유지)
-        self._loading_sheet = self._current_sheet
-        self._keep_scroll_next = True
-        self.status.setStatusText("창 크기에 맞춰 다시 불러오는 중…")
-        self.loader.setPageWidth(want)
-        self.loader.fetch(self._last_url)
+        self._start_load(self._current_sheet, self._last_url, keep_scroll=True,
+                         status="창 크기에 맞춰 다시 불러오는 중…")
 
     def _on_relayout_done(self, url: str, doc: dict) -> None:
         # 같은 주소를 보여주는 시트들의 문서를 새 배치로 교체
@@ -472,6 +496,8 @@ class MainWindow(QMainWindow):
             else:
                 self.sheet.clearAll()
                 self.status.setSummary(f"{self.tabs.sheetName(idx)} (비어 있음)")
+        # 다른 시트의 로드 문구가 남지 않게 — 도착 시트가 불러오는 중이면 그 상태로
+        self.status.setStatusText("로드 중…" if info.get("req") is not None else "준비")
 
         # 도착 시트의 저장된 스크롤 복원 — fillMatrix 끝난 뒤
         sv = info.get("scroll_v", 0)
@@ -488,6 +514,7 @@ class MainWindow(QMainWindow):
             self.sheet.verticalScrollBar().setValue(sv)
         self.sheet.horizontalScrollBar().setValue(sh)
         self._update_window_title()
+        self._update_favorite_mark()
 
     def _on_new_sheet(self) -> None:
         """+ 버튼 → 빈 namu 작업 시트 추가."""
@@ -500,6 +527,11 @@ class MainWindow(QMainWindow):
         if idx <= 0 or idx >= self.tabs.sheetCount():
             return
 
+        # 0) 그 시트에서 진행 중이던 로드 취소 (로딩 중 탭 닫기 = 취소)
+        closing = self._sheets.get(idx)
+        if closing is not None:
+            self._cancel_sheet_load(closing)
+
         # 1) TabBar 에서 위젯 제거
         self.tabs.closeSheet(idx)
 
@@ -511,19 +543,7 @@ class MainWindow(QMainWindow):
             new_sheets[k if k < idx else k - 1] = v
         self._sheets = new_sheets
 
-        # 3) pending / loading 인덱스 갱신
-        if self._pending_new_sheet is not None:
-            if self._pending_new_sheet == idx:
-                self._pending_new_sheet = None
-            elif self._pending_new_sheet > idx:
-                self._pending_new_sheet -= 1
-        if self._loading_sheet is not None:
-            if self._loading_sheet == idx:
-                self._loading_sheet = None  # 시작 시트가 닫힘 → fallback 처리됨
-            elif self._loading_sheet > idx:
-                self._loading_sheet -= 1
-
-        # 4) current_sheet 갱신 / 활성 탭 전환
+        # 3) current_sheet 갱신 / 활성 탭 전환
         if self._current_sheet == idx:
             new_active = max(0, idx - 1)
             self._current_sheet = new_active
@@ -542,19 +562,97 @@ class MainWindow(QMainWindow):
             href = self._last_url.split("#", 1)[0] + href
         new_idx = self.tabs.addSheet()
         self._sheets[new_idx] = {"type": "namu", "doc": {}, "title": href, "url": ""}
-        # 진행 중이던 현재 시트 로드는 취소됨 (로더가 하나)
-        self._loading_sheet = None
-        self._pending_new_sheet = new_idx
-        # 현재 시트는 그대로 두고 — 로드가 끝나도 탭 전환 없이 그 시트에 저장만 함
-        self._fetch(href)
+        # 현재 시트는 그대로 두고 (그 시트의 로드도 계속 진행) —
+        # 로드가 끝나도 탭 전환 없이 새 시트에 저장만 함
+        self._start_load(new_idx, href, background=True)
 
-    def _on_fetch_failed(self, title: str, msg: str) -> None:
+    # ------------------------------------------------------------------ favorites
+    def _current_doc_url(self) -> str:
+        """지금 보고 있는 나무위키 시트의 문서 주소 (없으면 "")."""
+        if self._sheets.get(self._current_sheet, {}).get("type") != "namu" or not self._last_doc:
+            return ""
+        return self._last_url
+
+    def _update_favorite_mark(self) -> None:
+        url = self._current_doc_url()
+        self.ribbon.setFavoriteMarked(bool(url) and favorites.contains(url))
+
+    def _show_favorites_menu(self) -> None:
+        menu = QMenu(self)
+        url = self._current_doc_url()
+        if url:
+            if favorites.contains(url):
+                act = menu.addAction("☆  현재 주소를 즐겨찾기에서 제거")
+                act.triggered.connect(lambda: self._remove_favorite(url))
+            else:
+                title = self._last_title
+                act = menu.addAction("★  현재 주소를 즐겨찾기에 추가")
+                act.triggered.connect(lambda: self._add_favorite(title, url))
+        items = favorites.load()
+        if items:
+            if url:
+                menu.addSeparator()
+            for it in items:
+                a = menu.addAction(it["title"])
+                a.triggered.connect(lambda _=False, u=it["url"]: self._open_favorite(u))
+            menu.addSeparator()
+            sub = menu.addMenu("삭제")
+            for it in items:
+                a = sub.addAction(it["title"])
+                a.triggered.connect(lambda _=False, u=it["url"]: self._remove_favorite(u))
+        elif not url:
+            menu.addAction("즐겨찾기가 비어 있습니다").setEnabled(False)
+        btn = self.ribbon.favoritesButton()
+        menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    def _add_favorite(self, title: str, url: str) -> None:
+        if favorites.add(title, url):
+            self.status.setStatusText(f"즐겨찾기에 추가: {title}")
+        else:
+            self.status.setStatusText("즐겨찾기 저장 실패")
+        self._update_favorite_mark()
+
+    def _remove_favorite(self, url: str) -> None:
+        favorites.remove(url)
+        self.status.setStatusText("즐겨찾기에서 제거됨")
+        self._update_favorite_mark()
+
+    def _open_favorite(self, url: str) -> None:
+        # 링크를 누른 것과 같다 — 지금 문서는 뒤로 가기 목록에 남는다
+        if self._sheets.get(self._current_sheet, {}).get("type") == "namu":
+            self._push_history()
+        self._on_search(url)
+
+    def _on_link_add_favorite(self, href: str) -> None:
+        if not href:
+            return
+        if href.startswith("#"):
+            # 페이지 안 링크 — 이 문서의 그 위치
+            if not self._last_url:
+                return
+            href = self._last_url.split("#", 1)[0] + href
+            title = f"{self._last_title} {link_title(href).split('#', 1)[-1]}"
+        else:
+            title = link_title(href)
+        self._add_favorite(title, href)
+
+    def _on_fetch_failed(self, rid: int, title: str, msg: str) -> None:
+        req, idx, _info = self._take_request(rid)
+        diag = self._diags.pop(rid, {})
+        if req is None or idx is None:
+            return
+        if idx != self._current_sheet:
+            # 보고 있지 않은 시트 — 화면은 건드리지 않고 상태 표시줄로만 알림
+            self.status.setStatusText(f"{self.tabs.sheetName(idx)} 실패: {msg}")
+            return
+        self._last_diag = diag
         self.status.setStatusText(f"실패: {msg}")
         self.status.setSummary("")
         self._dump_diagnostics(title, msg)
 
-    def _on_diagnostics(self, info: dict) -> None:
-        self._last_diag = info or {}
+    def _on_diagnostics(self, rid: int, info: dict) -> None:
+        if rid in self._requests:
+            self._diags[rid] = info or {}
 
     def _dump_diagnostics(self, title: str, err_msg: str) -> None:
         d = self._last_diag or {}
@@ -658,7 +756,7 @@ class MainWindow(QMainWindow):
             self._jump_in_page(href[1:])
             return
         self._push_history()
-        # search_edit / 윈도우 타이틀은 loadStarted 에서 추출 title 로 반영
+        # search_edit / 윈도우 타이틀은 _start_load 에서 반영
         self._on_search(href)
 
     def _go_back(self) -> None:

@@ -38,6 +38,7 @@ class RibbonBar(QWidget):
     searchRequested = Signal(str)
     backRequested = Signal()
     openOriginalRequested = Signal()
+    favoritesRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -77,6 +78,13 @@ class RibbonBar(QWidget):
     def search_edit(self) -> QLineEdit:
         assert self._search_edit is not None
         return self._search_edit
+
+    def favoritesButton(self) -> QToolButton:
+        return self._fav_btn
+
+    def setFavoriteMarked(self, marked: bool) -> None:
+        """지금 문서가 즐겨찾기에 있으면 ★, 없으면 ☆."""
+        self._fav_btn.setText("★" if marked else "☆")
 
     def setBackEnabled(self, enabled: bool) -> None:
         if self._back_btn is not None:
@@ -120,6 +128,17 @@ class RibbonBar(QWidget):
         self._back_btn.clicked.connect(self.backRequested.emit)
         box_lay.addWidget(self._back_btn)
 
+        # 즐겨찾기 — 누르면 메뉴 (내용은 MainWindow 가 그때그때 채움)
+        self._fav_btn = QToolButton(self._search_box)
+        self._fav_btn.setObjectName("RibbonBack")
+        self._fav_btn.setText("☆")
+        self._fav_btn.setToolTip("즐겨찾기")
+        self._fav_btn.setFixedSize(28, 22)
+        self._fav_btn.setFocusPolicy(Qt.NoFocus)
+        self._fav_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._fav_btn.clicked.connect(self.favoritesRequested.emit)
+        box_lay.addWidget(self._fav_btn)
+
         self._search_edit = QLineEdit(self._search_box)
         self._search_edit.setObjectName("RibbonSearch")
         self._search_edit.setPlaceholderText("🔍  검색하거나 사이트 찾기")
@@ -129,7 +148,7 @@ class RibbonBar(QWidget):
         box_lay.addWidget(self._search_edit, 1)
 
         # 넓은 창에서는 예전과 같은 자리 — 탭 줄 오른쪽 여백(8) 안쪽에 뒤로 버튼 + 280px 검색창
-        self._search_box_w = 6 + 28 + 6 + _SEARCH_W
+        self._search_box_w = 6 + 28 + 6 + 28 + 6 + _SEARCH_W
         self._tab_lay.addSpacing(self._search_box_w)
         self._visible_w: int | None = None
         self._place_search_box()
@@ -147,7 +166,7 @@ class RibbonBar(QWidget):
         bar_w = self._tab_bar.width() or self.width()
         vis = bar_w if self._visible_w is None else min(bar_w, self._visible_w)
         right = vis - 8
-        w = max(6 + 28 + 6 + _SEARCH_MIN_W, min(self._search_box_w, right))
+        w = max(6 + 28 + 6 + 28 + 6 + _SEARCH_MIN_W, min(self._search_box_w, right))
         self._search_box.setGeometry(right - w, 4, w, 22)
         self._search_box.raise_()
 

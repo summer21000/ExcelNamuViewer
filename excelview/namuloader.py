@@ -4,8 +4,90 @@ import json
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
+from PySide6.QtWebEngineCore import (
+    QWebEnginePage, QWebEngineProfile, QWebEngineSettings, QWebEngineUrlRequestInfo,
+    QWebEngineUrlRequestInterceptor,
+)
 from PySide6.QtWebEngineWidgets import QWebEngineView
+
+
+# 광고·추적 요청 차단 목록 (호스트가 이 도메인이거나 그 하위 도메인이면 차단).
+# 본문 배치와 상관없는 요청이라 막으면 페이지 로드가 빨라진다. 문서 주소(메인 프레임)는 막지 않음.
+_BLOCK_DOMAINS = (
+    "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+    "googletagservices.com", "googletagmanager.com", "google-analytics.com",
+    "adservice.google.com", "adservice.google.co.kr", "pagead2.googlesyndication.com",
+    "fundingchoicesmessages.google.com", "imasdk.googleapis.com",
+    "amazon-adsystem.com", "adnxs.com", "criteo.com", "criteo.net", "taboola.com",
+    "outbrain.com", "pubmatic.com", "rubiconproject.com", "openx.net", "casalemedia.com",
+    "scorecardresearch.com", "quantserve.com", "moatads.com", "adsrvr.org",
+    "smartadserver.com", "teads.tv", "yieldmo.com", "3lift.com", "sharethrough.com",
+    "connect.facebook.net", "analytics.tiktok.com", "ads-twitter.com",
+    "dable.io", "mobon.net", "realclick.co.kr", "tenping.kr", "adpnut.com",
+    "clarity.ms", "hotjar.com", "newrelic.com", "nr-data.net",
+)
+
+
+def _blocked_host(host: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    for d in _BLOCK_DOMAINS:
+        if host == d or host.endswith("." + d):
+            return True
+    return False
+
+
+class _AdBlocker(QWebEngineUrlRequestInterceptor):
+    def interceptRequest(self, info) -> None:  # noqa: N802 (Qt 이름)
+        try:
+            if info.resourceType() == QWebEngineUrlRequestInfo.ResourceType.ResourceTypeMainFrame:
+                return
+            if _blocked_host(info.requestUrl().host()):
+                info.block(True)
+        except Exception:
+            pass
+
+
+# 본문이 준비되면 페이지가 직접 알려 준다 (시간을 정해 두고 기다리지 않음).
+# 준비 조건: 문서 로드 완료 + 본문 글자 + (나무위키면) 문서 제목 h1.
+# 이미 준비됐으면 바로, 아니면 DOM 이 바뀔 때마다(MutationObserver) 다시 확인해서
+# 조건이 맞는 순간 console 로 신호(tag)를 보낸다 → _Page.javaScriptConsoleMessage 가 받음.
+# afterChange: 추출 재시도용 — 지금 상태는 건너뛰고 다음 DOM 변화부터 확인.
+_WAIT_JS = r"""
+(function(tag, needH1, afterChange) {
+  var done = false;
+  function ok() {
+    var b = document.body;
+    return document.readyState === 'complete' && !!b &&
+           (b.innerText || '').length > 0 && (!needH1 || !!document.querySelector('h1'));
+  }
+  function check() {
+    if (done || !ok()) return;
+    done = true;
+    try { mo.disconnect(); } catch (e) {}
+    document.removeEventListener('readystatechange', check);
+    console.log(tag);
+  }
+  var mo = new MutationObserver(check);
+  mo.observe(document.documentElement, {childList: true, subtree: true, characterData: true});
+  document.addEventListener('readystatechange', check);
+  if (!afterChange) check();
+})(%s, %s, %s);
+"""
+
+_READY_TAG = "__excelview_ready__"
+
+
+class _Page(QWebEnginePage):
+    """페이지 안 JS 가 보낸 준비 신호(console 메시지)를 시그널로 바꿔 주는 페이지."""
+
+    readySignal = Signal(int)   # 대기 세대
+
+    def javaScriptConsoleMessage(self, level, message, line, source) -> None:  # noqa: N802
+        if message.startswith(_READY_TAG):
+            try:
+                self.readySignal.emit(int(message[len(_READY_TAG):]))
+            except ValueError:
+                pass
 
 
 _UA_CHROME = (
@@ -104,6 +186,46 @@ JSON.stringify((function() {
     var bodyLen = (body.innerText || '').length;
     if (!root || root === body || (root.innerText || '').length < bodyLen * 0.3) return body;
     return root;
+  }
+
+  // 본문 사이에 끼워 넣은 텍스트 광고 (파워링크 등). 클래스 이름은 무작위라 쓸 수 없고,
+  // 링크를 문단 이동(#s-N)으로 위장한다 — 그런데 링크 글자가 목차 숫자도, 가리키는 문단의
+  // 제목도 아니고, 광고 문구에 도메인(www.○○.com 등)이 들어 있다. 이런 표와 그 표만
+  // 감싼 상위 요소를 통째로 뺀다.
+  var textAds = new Set();
+  var DOMAIN_RE = /(^|[\s(])(www\.)?[a-z0-9-]+(\.[a-z0-9-]+)*\.(com|net|kr|co\.kr|org|biz|info|shop|io)(\/\S*)?(\s|$|\))/i;
+  function markTextAds(root) {
+    // 나무위키의 위장 광고만 — 다른 사이트 내용은 건드리지 않는다
+    var host = location.hostname || '';
+    if (host !== 'namu.wiki' && !/\.namu\.wiki$/.test(host)) return;
+    var tables = root.querySelectorAll('table');
+    for (var i = 0; i < tables.length; i++) {
+      var t = tables[i];
+      var links = t.querySelectorAll('a[href]');
+      if (links.length < 2) continue;
+      var fake = 0, genuine = false;
+      for (var j = 0; j < links.length; j++) {
+        var href = links[j].getAttribute('href') || '';
+        if (!/^#s-/.test(href)) { genuine = true; break; }
+        var txt = (links[j].innerText || '').replace(/\s+/g, ' ').trim();
+        if (!txt) continue;
+        var tgt = document.getElementById(href.substring(1));
+        var tt = tgt ? (tgt.innerText || '').replace(/\s+/g, ' ').trim() : '';
+        // 진짜 문단 링크: 목차 숫자이거나, 가리키는 문단 제목에 링크 글자가 들어 있음
+        if (/^[\d.]+$/.test(txt) || (tt && tt.indexOf(txt) >= 0)) { genuine = true; break; }
+        fake++;
+      }
+      if (genuine || fake < 2) continue;
+      var all = (t.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!DOMAIN_RE.test(all)) continue;
+      // 이 표만 감싼 상위 요소(글자가 같음)까지 올라가 통째로
+      var top = t;
+      while (top.parentElement && top.parentElement !== root &&
+             (top.parentElement.innerText || '').replace(/\s+/g, ' ').trim() === all) {
+        top = top.parentElement;
+      }
+      textAds.add(top);
+    }
   }
 
   function inter(a, b) {
@@ -316,7 +438,8 @@ JSON.stringify((function() {
                  w: Math.round(r.width), h: Math.round(r.height), b: ctx.blk});
   }
 
-  var BULLET = {disc: '•', circle: '◦', square: '▪'};
+  var BULLET = {disc: '•', circle: '◦', square: '▪',
+                'disclosure-closed': '▸', 'disclosure-open': '▾'};
   function markerText(li, type) {
     if (BULLET[type]) return BULLET[type];
     var n = 1;
@@ -341,8 +464,12 @@ JSON.stringify((function() {
 
   function walk(el, ctx) {
     var ch = el.childNodes;
+    // 접힌 <details>(나무위키 틀의 탭/접기 상자)는 제목(summary)만 — 접힌 내용은 화면에
+    // 안 그려지는데, 위치를 물으면 브라우저가 억지로 배치해 여러 탭 내용이 겹쳐 들어온다
+    var closedDetails = el.nodeName === 'DETAILS' && !el.open;
     for (var i = 0; i < ch.length; i++) {
       var c = ch[i];
+      if (closedDetails && !(c.nodeType === 1 && c.nodeName === 'SUMMARY')) continue;
       if (c.nodeType === 3) { pushText(c, ctx); continue; }
       if (c.nodeType === 1 && c.nodeName === 'IFRAME') { pushEmbed(c, ctx); continue; }
       if (c.nodeType !== 1 || SKIP[c.nodeName]) continue;
@@ -350,7 +477,7 @@ JSON.stringify((function() {
       try { s = window.getComputedStyle(c); } catch (e) { continue; }
       if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse') continue;
       if (num(s.opacity) === 0 && s.opacity !== '') continue;
-      if (isAd(c)) continue;
+      if (isAd(c) || textAds.has(c)) continue;
 
       var n = {href: ctx.href, fn: ctx.fn, clip: ctx.clip, blk: ctx.blk,
                st: ctx.st, strike: ctx.strike};
@@ -413,6 +540,7 @@ JSON.stringify((function() {
                readyState: document.readyState };
     }
     var root = contentRoot();
+    markTextAds(root);
     walk(root, {href: null, fn: null, clip: null, blk: -1,
                 st: styleOf(window.getComputedStyle(root), {}), strike: 0});
     // 이동 대상의 페이지 y 좌표 — 시트에서는 이 높이의 행으로 이동
@@ -438,99 +566,157 @@ JSON.stringify((function() {
 """
 
 
-class NamuLoader(QObject):
-    """Hidden QWebEnginePage that loads namu.wiki and extracts positioned tokens."""
+class _Job:
+    """로드 요청 하나 = 숨은 브라우저 탭 하나 (페이지 + 렌더 크기용 숨은 뷰)."""
 
-    loadStarted = Signal(str)
-    loadProgress = Signal(int)
-    pageLoaded = Signal()  # 페이지 로드 성공 (본문 추출은 이제 시작)
-    # title, doc (tokens/styles/pageW/pageH — namuformatter 입력), source_url
-    bodyExtracted = Signal(str, dict, str)
+    def __init__(self, rid: int, page: QWebEnginePage, view: QWebEngineView,
+                 title: str, url: str) -> None:
+        self.rid = rid
+        self.page = page
+        self.view = view
+        self.title = title
+        self.url = url
+        self.loading = True
+        self.gen = 0        # loadFinished 세대 — JS 리다이렉트로 다시 로드되면 최신 것만 추출
+        self.attempts = 0
+        self.watchdog: QTimer | None = None   # 준비 신호가 끝내 안 올 때만 쓰는 안전장치
+
+
+class NamuLoader(QObject):
+    """namu.wiki 를 숨은 QWebEnginePage 로 불러와 위치 정보가 붙은 조각을 추출한다.
+
+    요청(fetch)마다 페이지를 따로 만든다 — 브라우저 탭처럼 여러 로드가 동시에 진행돼도
+    서로 끊거나 결과를 가로채지 않는다. 모든 시그널의 첫 인자는 요청 번호(rid).
+    """
+
+    loadProgress = Signal(int, int)          # rid, %
+    pageLoaded = Signal(int)                 # rid — 페이지 로드 성공 (본문 추출은 이제 시작)
+    # rid, title, doc (tokens/styles/pageW/pageH — namuformatter 입력), source_url
+    bodyExtracted = Signal(int, str, dict, str)
     # 창 크기 변경으로 같은 페이지를 새 폭으로 다시 배치해서 읽은 결과: source_url, doc
     relayoutDone = Signal(str, dict)
-    fetchFailed = Signal(str, str)
-    diagnostics = Signal(dict)
+    fetchFailed = Signal(int, str, str)      # rid, title, 사유
+    diagnostics = Signal(int, dict)          # rid, 진단 정보
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
 
         profile = QWebEngineProfile("ExcelViewNamu", self)
         profile.setHttpUserAgent(_UA_CHROME)
+        self._adblock = _AdBlocker(self)   # 참조 유지 필수 (프로필은 소유하지 않음)
+        profile.setUrlRequestInterceptor(self._adblock)
         s = profile.settings()
         s.setAttribute(QWebEngineSettings.JavascriptEnabled, True)
         s.setAttribute(QWebEngineSettings.LocalStorageEnabled, True)
-        s.setAttribute(QWebEngineSettings.AutoLoadImages, True)  # 이미지 보여야 layout이 정확
+        # 이미지는 내려받지 않는다 — 시트에는 "[사진보기]" 로만 나오고, 누르면 사진 창이
+        # 주소로 직접 받아 온다. 주소·자리(크기)는 태그 속성만으로 추출됨 (켬/끔 비교로 확인)
+        s.setAttribute(QWebEngineSettings.AutoLoadImages, False)
         s.setAttribute(QWebEngineSettings.ShowScrollBars, False)
         s.setAttribute(QWebEngineSettings.LocalContentCanAccessRemoteUrls, True)
         s.setAttribute(QWebEngineSettings.LocalContentCanAccessFileUrls, True)
+        self._profile = profile
 
-        self._page = QWebEnginePage(profile, self)
-        self._page.loadStarted.connect(self._on_page_load_started)
-        self._page.loadProgress.connect(self._on_progress)
-        self._page.loadFinished.connect(self._on_loaded)
-
-        # hidden view 로 viewport 확보 — layout 계산 (getBoundingClientRect) 이 동작하려면
-        # page 가 실제 렌더 사이즈를 가져야 한다. WA_DontShowOnScreen 으로 화면엔 안 뜸.
-        self._hidden_view = QWebEngineView()
-        self._hidden_view.setPage(self._page)
-        self._hidden_view.setAttribute(Qt.WA_DontShowOnScreen, True)
-        self._hidden_view.resize(1280, 900)
-        self._hidden_view.show()
-
-        self._current_title = ""
-        self._current_url = ""
-        self._gen = 0  # fetch 세대 — 이전 로드의 지연 추출 타이머가 새 페이지에 끼어들지 않게
-        self._page_ready = False  # 현재 페이지 추출까지 끝났는지 (다시 배치 가능 여부)
-        # 페이지 로드가 아직 안 끝났는지 — 끝난 뒤(실패 포함) 늦게 오는 진행률이
-        # 상태 표시줄의 실패 문구를 "렌더링 완료" 로 덮지 않게 진행률은 이때만 전달
-        self._loading = False
+        self._jobs: dict[int, _Job] = {}   # 진행 중인 요청
+        # 마지막으로 추출까지 끝난 페이지 — 창 크기 변경 시 네트워크 없이 다시 배치할 때 사용
+        self._ready: _Job | None = None
+        self._next_rid = 0
+        self._page_w = 1280
         self._relayout_gen = 0
-        self._extract_attempts = 0
         self._max_attempts = 4
-        self._extract_delay_ms = 5000
+        # 정상 흐름은 페이지의 준비 신호로만 진행한다. 이 값은 신호가 끝내 오지 않을 때
+        # (Cloudflare 확인 화면에 멈춤 등) 무한정 "로드 중" 에 머물지 않게 하는 실패 처리용.
+        self._watchdog_ms = 15000
 
         self._debug_view: QWebEngineView | None = None
 
+    # ------------------------------------------------------------------ pages
+    def _new_job(self, title: str, url: str) -> _Job:
+        self._next_rid += 1
+        rid = self._next_rid
+        page = _Page(self._profile, self)
+        page.readySignal.connect(lambda g, r=rid: self._on_ready(r, g))
+        page.loadStarted.connect(lambda r=rid: self._on_page_load_started(r))
+        page.loadProgress.connect(lambda p, r=rid: self._on_progress(r, p))
+        page.loadFinished.connect(lambda ok, r=rid: self._on_loaded(r, ok))
+        # hidden view 로 viewport 확보 — layout 계산 (getBoundingClientRect) 이 동작하려면
+        # page 가 실제 렌더 사이즈를 가져야 한다. WA_DontShowOnScreen 으로 화면엔 안 뜸.
+        view = QWebEngineView()
+        view.setPage(page)
+        view.setAttribute(Qt.WA_DontShowOnScreen, True)
+        view.resize(self._page_w, 900)
+        view.show()
+        job = _Job(rid, page, view, title, url)
+        self._jobs[rid] = job
+        return job
+
+    def _destroy(self, job: _Job | None) -> None:
+        if job is None:
+            return
+        if job.watchdog is not None:
+            job.watchdog.stop()
+            job.watchdog.deleteLater()
+            job.watchdog = None
+        try:
+            if self._debug_view is not None and self._debug_view.page() == job.page:
+                self._debug_view.setPage(QWebEnginePage(self._profile, self._debug_view))
+        except Exception:
+            pass
+        try:
+            job.page.triggerAction(QWebEnginePage.WebAction.Stop)
+        except Exception:
+            pass
+        # 뷰를 먼저 지우고 페이지를 지운다 (deleteLater 는 넣은 순서대로 처리됨)
+        try:
+            job.view.close()
+            job.view.deleteLater()
+        except Exception:
+            pass
+        try:
+            job.page.deleteLater()
+        except Exception:
+            pass
+
     def setPageWidth(self, css_px: int) -> None:
-        """렌더링 폭(CSS px). 시트 폭에 맞춰 두면 줄바꿈 위치가 시트와 같아진다.
+        """다음에 여는 페이지의 렌더링 폭(CSS px). 시트 폭에 맞춰 두면 줄바꿈 위치가 시트와 같아진다.
 
         창을 줄이면 이 폭도 줄어든다 — 좁으면 나무위키도 좁은 화면용 배치(사이드바 없음)로 바뀜.
         """
-        css_px = max(360, min(3000, int(css_px)))
-        if self._hidden_view is not None and self._hidden_view.width() != css_px:
-            self._hidden_view.resize(css_px, 900)
+        self._page_w = max(360, min(3000, int(css_px)))
 
     def loadedUrl(self) -> str:
         """다시 배치(relayout)할 수 있는 상태로 열려 있는 페이지 주소. 없으면 ""."""
-        return self._current_url if self._page_ready else ""
+        return self._ready.url if self._ready is not None else ""
 
     def relayout(self, css_px: int) -> bool:
-        """지금 열린 페이지를 새 폭으로 다시 배치하고 다시 추출 (네트워크 없이).
+        """마지막으로 연 페이지를 새 폭으로 다시 배치하고 다시 추출 (네트워크 없이).
 
         결과는 relayoutDone 으로. 페이지가 준비 안 됐으면 False.
         """
-        if not self._page_ready or self._page is None:
+        job = self._ready
+        if job is None:
             return False
         self.setPageWidth(css_px)
+        if job.view.width() != self._page_w:
+            job.view.resize(self._page_w, 900)
         self._relayout_gen += 1
         gen = self._relayout_gen
 
         def run() -> None:
-            if gen != self._relayout_gen or not self._page_ready or self._page is None:
+            if gen != self._relayout_gen or self._ready is not job:
                 return
-            self._page.runJavaScript(
-                _EXTRACT_JS, lambda res, g=gen: self._on_relayout_extracted(res, g)
+            job.page.runJavaScript(
+                _EXTRACT_JS, lambda res, g=gen, j=job: self._on_relayout_extracted(res, g, j)
             )
         # 크기 변경 후 렌더러가 다시 배치할 시간
         QTimer.singleShot(400, run)
         return True
 
-    def _on_relayout_extracted(self, result, gen: int) -> None:
-        if gen != self._relayout_gen or not self._page_ready:
+    def _on_relayout_extracted(self, result, gen: int, job: _Job) -> None:
+        if gen != self._relayout_gen or self._ready is not job:
             return
         info = self._parse_result(result)
         if info.get("ok") and info.get("tokens"):
-            self.relayoutDone.emit(self._current_url, self._doc_from(info))
+            self.relayoutDone.emit(job.url, self._doc_from(info, job))
 
     def cleanup(self) -> None:
         """앱 종료 시 명시적으로 호출 — QtWebEngine helper 프로세스가 좀비로 남지 않게.
@@ -540,34 +726,29 @@ class NamuLoader(QObject):
         """
         try:
             if self._debug_view is not None:
-                self._debug_view.setPage(None)
                 self._debug_view.close()
                 self._debug_view.deleteLater()
                 self._debug_view = None
         except Exception:
             pass
-        try:
-            if self._hidden_view is not None:
-                self._hidden_view.setPage(None)
-                self._hidden_view.close()
-                self._hidden_view.deleteLater()
-                self._hidden_view = None
-        except Exception:
-            pass
-        try:
-            if self._page is not None:
-                self._page.setUrl(QUrl("about:blank"))
-                self._page.deleteLater()
-                self._page = None
-        except Exception:
-            pass
+        for job in list(self._jobs.values()):
+            self._destroy(job)
+        self._jobs.clear()
+        self._destroy(self._ready)
+        self._ready = None
 
     def showDebugView(self) -> None:
+        job = self._ready
+        if job is None and self._jobs:
+            job = self._jobs[max(self._jobs)]   # 가장 최근에 시작한 로드
+        if job is None:
+            return
         if self._debug_view is None:
             self._debug_view = QWebEngineView()
-            self._debug_view.setPage(self._page)
             self._debug_view.setWindowTitle("[디버그] namu.wiki 직접 보기")
             self._debug_view.resize(1280, 900)
+        if self._debug_view.page() != job.page:
+            self._debug_view.setPage(job.page)
         self._debug_view.show()
         self._debug_view.raise_()
         self._debug_view.activateWindow()
@@ -587,67 +768,112 @@ class NamuLoader(QObject):
             pass
         return t
 
-    def fetch(self, title_or_url: str) -> None:
-        s = title_or_url.strip()
+    def _resolve(self, s: str) -> tuple[QUrl, str, str]:
+        """입력(제목/주소/파일 경로) → (QUrl, 제목, 주소 문자열)."""
         if s.lower().startswith(("file:", "http://", "https://")):
-            qurl = QUrl(s)
-            self._current_title = self._title_from_path(s)
-            self._current_url = s
-        elif s.startswith("/"):
+            return QUrl(s), self._title_from_path(s), s
+        if s.startswith("/"):
             # namu.wiki 상대 경로 — 절대 URL 로 보정
-            self._current_url = "https://namu.wiki" + s
-            qurl = QUrl(self._current_url)
-            self._current_title = self._title_from_path(s)
-        else:
-            try:
-                from pathlib import Path as _P
-                p = _P(s)
-                if p.exists() and p.is_file():
-                    qurl = QUrl.fromLocalFile(str(p.resolve()))
-                    self._current_title = p.name
-                    self._current_url = qurl.toString()
-                else:
-                    raise FileNotFoundError
-            except Exception:
-                # 나무위키 검색창과 같은 /Go 경로 — 띄어쓰기/대소문자가 달라도 문서를 찾아가고,
-                # 없으면 검색 결과 페이지로 간다. (/w/제목 은 정확히 일치해야만 열림)
-                self._current_title = s
-                self._current_url = f"https://namu.wiki/Go?q={quote(s, safe='')}"
-                qurl = QUrl(self._current_url)
+            url = "https://namu.wiki" + s
+            return QUrl(url), self._title_from_path(s), url
+        try:
+            from pathlib import Path as _P
+            p = _P(s)
+            if p.exists() and p.is_file():
+                qurl = QUrl.fromLocalFile(str(p.resolve()))
+                return qurl, p.name, qurl.toString()
+        except Exception:
+            pass
+        # 나무위키 검색창과 같은 /Go 경로 — 띄어쓰기/대소문자가 달라도 문서를 찾아가고,
+        # 없으면 검색 결과 페이지로 간다. (/w/제목 은 정확히 일치해야만 열림)
+        url = f"https://namu.wiki/Go?q={quote(s, safe='')}"
+        return QUrl(url), s, url
 
-        self._gen += 1
-        self._page_ready = False
-        self._relayout_gen += 1   # 진행 중이던 다시 배치는 무효
-        self._extract_attempts = 0
-        self._loading = True
-        self.loadStarted.emit(self._current_title)
-        self._page.load(qurl)
+    def fetch(self, title_or_url: str) -> tuple[int, str]:
+        """새 페이지(탭)에서 로드 시작. (요청 번호, 표시용 제목) 반환.
 
-    def _on_progress(self, p: int) -> None:
-        # 100% 는 보내지 않는다 — 실패해도 100% 가 오므로 성공 여부는 loadFinished 로만 판단
-        if self._loading and p < 100:
-            self.loadProgress.emit(p)
+        진행 중인 다른 요청에는 영향이 없다 — 그만두려면 cancel(rid).
+        """
+        qurl, title, url = self._resolve(title_or_url.strip())
+        job = self._new_job(title, url)
+        job.page.load(qurl)
+        return job.rid, title
 
-    def _on_page_load_started(self) -> None:
-        self._loading = True
-        self.loadProgress.emit(0)
+    def cancel(self, rid: int) -> None:
+        """진행 중인 요청을 취소 — 이후 그 요청의 시그널은 오지 않는다."""
+        job = self._jobs.pop(rid, None)
+        if job is not None:
+            self._destroy(job)
 
-    def _on_loaded(self, ok: bool) -> None:
-        self._loading = False
+    def _on_progress(self, rid: int, p: int) -> None:
+        job = self._jobs.get(rid)
+        # 100% 는 보내지 않는다 — 실패해도 100% 가 오므로 성공 여부는 loadFinished 로만 판단.
+        # 로드가 끝난 뒤(실패 포함) 늦게 오는 진행률이 실패 문구를 덮지 않게 로딩 중에만.
+        if job is not None and job.loading and p < 100:
+            self.loadProgress.emit(rid, p)
+
+    def _on_page_load_started(self, rid: int) -> None:
+        job = self._jobs.get(rid)
+        if job is None:
+            return
+        job.loading = True
+        self.loadProgress.emit(rid, 0)
+
+    def _on_loaded(self, rid: int, ok: bool) -> None:
+        job = self._jobs.get(rid)
+        if job is None:
+            return
+        job.loading = False
+        job.gen += 1   # 이전에 걸어 둔 추출 타이머는 무효
         if not ok:
-            self.fetchFailed.emit(self._current_title, "페이지를 불러오지 못했습니다")
+            self._fail(job, "페이지를 불러오지 못했습니다")
             return
-        self.pageLoaded.emit()
-        gen = self._gen
-        QTimer.singleShot(self._extract_delay_ms, lambda: self._run_extract(gen))
+        self.pageLoaded.emit(rid)
+        self._wait_ready(job, after_change=False)
+        # 안전장치 — 준비 신호가 끝내 안 오면 그 상태로 추출해 보고, 안 되면 실패 처리
+        if job.watchdog is None:
+            job.watchdog = QTimer(self)
+            job.watchdog.setSingleShot(True)
+            job.watchdog.timeout.connect(lambda r=rid: self._on_watchdog(r))
+        job.watchdog.start(self._watchdog_ms)
 
-    def _run_extract(self, gen: int) -> None:
-        if gen != self._gen or self._page is None:
+    def _wait_ready(self, job: _Job, after_change: bool) -> None:
+        """페이지 안에 준비 감시를 건다 — 준비되는 순간 _on_ready 가 불린다."""
+        host = (QUrl(job.url).host() or "").lower()
+        need_h1 = host == "namu.wiki" or host.endswith(".namu.wiki")
+        js = _WAIT_JS % (json.dumps(f"{_READY_TAG}{job.gen}"),
+                         "true" if need_h1 else "false",
+                         "true" if after_change else "false")
+        job.page.runJavaScript(js)
+
+    def _on_ready(self, rid: int, gen: int) -> None:
+        job = self._jobs.get(rid)
+        if job is None or gen != job.gen or job.loading:
             return
-        self._extract_attempts += 1
-        self._page.runJavaScript(
-            _EXTRACT_JS, lambda res, g=gen: self._on_extracted(res, g)
+        self._run_extract(rid, gen)
+
+    def _on_watchdog(self, rid: int) -> None:
+        job = self._jobs.get(rid)
+        if job is None or job.loading:
+            return
+        job.attempts = self._max_attempts - 1   # 마지막 한 번만 시도하고 안 되면 실패
+        self._run_extract(rid, job.gen)
+
+    def _run_extract(self, rid: int, gen: int) -> None:
+        job = self._jobs.get(rid)
+        if job is None or gen != job.gen or job.loading:
+            return
+        job.attempts += 1
+        job.page.runJavaScript(
+            _EXTRACT_JS, lambda res, r=rid, g=gen: self._on_extracted(r, g, res)
         )
+
+    def _fail(self, job: _Job, msg: str, info: dict | None = None) -> None:
+        self._jobs.pop(job.rid, None)
+        if info is not None:
+            self.diagnostics.emit(job.rid, info)
+        self.fetchFailed.emit(job.rid, job.title, msg)
+        self._destroy(job)
 
     @staticmethod
     def _page_title(doc_title: str, url: str, fallback: str) -> str:
@@ -674,7 +900,8 @@ class NamuLoader(QObject):
         return {"ok": False, "sel": "no-result",
                 "error": f"runJavaScript 결과가 빈 값 (type={type(result).__name__})"}
 
-    def _doc_from(self, info: dict) -> dict:
+    @staticmethod
+    def _doc_from(info: dict, job: _Job) -> dict:
         return {
             "tokens": info.get("tokens") or [],
             "styles": info.get("styles") or [],
@@ -682,27 +909,35 @@ class NamuLoader(QObject):
             "pageW": int(info.get("pageW") or 1280),
             "pageH": int(info.get("pageH") or 800),
             # 이 문서를 렌더링한 폭 — 창 크기와 다르면 다시 배치 대상
-            "renderW": self._hidden_view.width() if self._hidden_view is not None else 0,
+            "renderW": job.view.width(),
         }
 
-    def _on_extracted(self, result, gen: int) -> None:
-        if gen != self._gen:
+    def _on_extracted(self, rid: int, gen: int, result) -> None:
+        job = self._jobs.get(rid)
+        if job is None or gen != job.gen:
             return
         info = self._parse_result(result)
         ok = bool(info.get("ok"))
         tokens = info.get("tokens") or []
 
         if ok and tokens:
-            url = info.get("url") or self._current_url
-            self._current_title = self._page_title(info.get("title", ""), url, self._current_title)
-            self._current_url = url
-            self._page_ready = True
-            self.bodyExtracted.emit(self._current_title, self._doc_from(info), self._current_url)
+            url = info.get("url") or job.url
+            job.title = self._page_title(info.get("title", ""), url, job.title)
+            job.url = url
+            doc = self._doc_from(info, job)
+            # 이 페이지를 다시 배치용으로 남기고, 전에 남겨 둔 페이지는 정리
+            self._jobs.pop(rid, None)
+            if job.watchdog is not None:
+                job.watchdog.stop()
+            old, self._ready = self._ready, job
+            self._relayout_gen += 1   # 이전 페이지에 걸린 다시 배치는 무효
+            self._destroy(old)
+            self.bodyExtracted.emit(rid, job.title, doc, job.url)
             return
 
-        if self._extract_attempts < self._max_attempts:
-            QTimer.singleShot(1500, lambda: self._run_extract(gen))
+        if job.attempts < self._max_attempts:
+            # 아직 본문이 덜 그려짐 — 다음 DOM 변화가 오면 다시 시도
+            self._wait_ready(job, after_change=True)
             return
 
-        self.diagnostics.emit(info)
-        self.fetchFailed.emit(self._current_title, "본문을 찾지 못했습니다 (selector 미스)")
+        self._fail(job, "본문을 찾지 못했습니다 (selector 미스)", info)
