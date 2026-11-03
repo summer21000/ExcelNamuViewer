@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtWebEngineCore import (
-    QWebEnginePage, QWebEngineProfile, QWebEngineSettings, QWebEngineUrlRequestInfo,
+    QWebEngineLoadingInfo, QWebEnginePage, QWebEngineProfile, QWebEngineSettings,
+    QWebEngineUrlRequestInfo,
     QWebEngineUrlRequestInterceptor,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -57,8 +59,11 @@ _WAIT_JS = r"""
   var done = false;
   function ok() {
     var b = document.body;
+    // 글자가 없어도 iframe 이 있으면 준비된 것 — 본문이 iframe 안에 있는 사이트는
+    // 추출 단계에서 그 iframe 주소를 직접 연다
     return document.readyState === 'complete' && !!b &&
-           (b.innerText || '').length > 0 && (!needH1 || !!document.querySelector('h1'));
+           ((b.innerText || '').length > 0 || !!document.querySelector('iframe')) &&
+           (!needH1 || !!document.querySelector('h1'));
   }
   function check() {
     if (done || !ok()) return;
@@ -82,12 +87,33 @@ class _Page(QWebEnginePage):
 
     readySignal = Signal(int)   # 대기 세대
 
+    # 숨은 페이지는 대화상자를 띄우지 않는다 — 기본 동작은 보이지 않는 모달 창을 띄우고
+    # 응답을 기다려서 다른 시트의 로드까지 멈춘다 (네이버 블로그 "게시물이 삭제…" alert 등).
+    # 위장 면에서도 숨은 페이지가 창을 띄우면 안 됨.
+    def javaScriptAlert(self, origin, msg) -> None:  # noqa: N802
+        pass
+
+    def javaScriptConfirm(self, origin, msg) -> bool:  # noqa: N802
+        return False
+
+    def javaScriptPrompt(self, origin, msg, default):  # noqa: N802
+        return False, ""
+
     def javaScriptConsoleMessage(self, level, message, line, source) -> None:  # noqa: N802
         if message.startswith(_READY_TAG):
             try:
                 self.readySignal.emit(int(message[len(_READY_TAG):]))
             except ValueError:
                 pass
+
+
+# https:// 없이 입력한 웹 주소로 볼 입력 — 소문자 + 공백 없음 + 알려진 도메인 끝자리 (+ 경로)
+_DOMAIN_INPUT_RE = re.compile(
+    r"^(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*"
+    r"\.(?:com|net|org|kr|co\.kr|or\.kr|go\.kr|ac\.kr|re\.kr|ne\.kr|io|me|tv|jp|co\.jp|"
+    r"cn|uk|co\.uk|de|fr|edu|gov|info|biz|dev|app|ai|xyz|wiki|gg)"
+    r"(?::\d+)?(?:[/?#]\S*)?$",
+)   # 대소문자 구분 — 주소는 보통 소문자로 입력. "ASP.NET" 같은 대문자 제목은 나무위키로
 
 
 _UA_CHROME = (
@@ -114,9 +140,9 @@ JSON.stringify((function() {
   // 단어 경계(\b)로 false positive (address, headline 등) 회피.
   var AD_RE = /(^|[\s_-])(ad|ads|gad|adv|advert|adunit|adsense|adsbygoogle|sponsor|sponsored|promo|partnerpixel)([\s_-]|$)/i;
   function isAd(el) {
-    var id = el.id || '';
-    var cls = el.className;
-    if (typeof cls !== 'string') cls = (cls && cls.baseVal) || '';
+    // el.id / el.className 은 <form> 안에 name="id" 입력칸이 있으면 그 요소가 됨 — 속성으로 읽음
+    var id = (el.getAttribute && el.getAttribute('id')) || '';
+    var cls = (el.getAttribute && el.getAttribute('class')) || '';
     if (AD_RE.test(id)) return true;
     if (AD_RE.test(cls)) return true;
     if (id.indexOf('google_ads') >= 0) return true;
@@ -186,6 +212,25 @@ JSON.stringify((function() {
     var bodyLen = (body.innerText || '').length;
     if (!root || root === body || (root.innerText || '').length < bodyLen * 0.3) return body;
     return root;
+  }
+
+  // 본문이 통째로 iframe 안에 있는 사이트(네이버 블로그 등) — 화면 대부분을 차지하는
+  // 가장 큰 iframe 의 주소. 바깥 페이지에 글자가 거의 없으면 이 주소를 직접 열어서 읽는다.
+  function mainFrame() {
+    var best = null, bestArea = 0;
+    var vw = document.documentElement.clientWidth || window.innerWidth;
+    var fr = document.querySelectorAll('iframe');
+    for (var i = 0; i < fr.length; i++) {
+      var f = fr[i];
+      var src = f.src || '';
+      if (!/^https?:/.test(src) || isAd(f)) continue;
+      var s = window.getComputedStyle(f);
+      if (s.display === 'none' || s.visibility === 'hidden') continue;
+      var r = f.getBoundingClientRect();
+      if (r.width < vw * 0.5 || r.height < 300) continue;
+      if (r.width * r.height > bestArea) { bestArea = r.width * r.height; best = src; }
+    }
+    return best;
   }
 
   // 본문 사이에 끼워 넣은 텍스트 광고 (파워링크 등). 클래스 이름은 무작위라 쓸 수 없고,
@@ -557,7 +602,9 @@ JSON.stringify((function() {
       ok: true, sel: root === document.body ? 'body' : 'content',
       tokens: tokens, styles: styles, anchors: anchors,
       pageW: pageW, pageH: pageH,
-      title: document.title, url: location.href
+      title: document.title, url: location.href,
+      textLen: (document.body.innerText || '').replace(/\s+/g, '').length,
+      frame: mainFrame()
     };
   } catch (e) {
     return { ok: false, sel: 'error', error: String(e) + ' @ ' + (e.stack || '') };
@@ -579,6 +626,11 @@ class _Job:
         self.loading = True
         self.gen = 0        # loadFinished 세대 — JS 리다이렉트로 다시 로드되면 최신 것만 추출
         self.attempts = 0
+        self.frame_hops = 0   # 본문 iframe 을 따라 들어간 횟수 (무한 반복 방지)
+        # 서버가 오류 코드(404 등)로 응답했을 때 그 코드 — 브라우저처럼 서버가 보낸 안내
+        # 페이지를 그대로 보여 준다. 접속 자체 실패(연결 끊김 등)와 구분하는 용도
+        self.http_status: int | None = None
+        self.net_error: int | None = None
         self.watchdog: QTimer | None = None   # 준비 신호가 끝내 안 올 때만 쓰는 안전장치
 
 
@@ -637,7 +689,8 @@ class NamuLoader(QObject):
         page.readySignal.connect(lambda g, r=rid: self._on_ready(r, g))
         page.loadStarted.connect(lambda r=rid: self._on_page_load_started(r))
         page.loadProgress.connect(lambda p, r=rid: self._on_progress(r, p))
-        page.loadFinished.connect(lambda ok, r=rid: self._on_loaded(r, ok))
+        # 로드 결과는 loadingChanged 로만 판단 (성공/서버 오류 응답/접속 실패/중단 구분)
+        page.loadingChanged.connect(lambda li, r=rid: self._on_loading_changed(r, li))
         # hidden view 로 viewport 확보 — layout 계산 (getBoundingClientRect) 이 동작하려면
         # page 가 실제 렌더 사이즈를 가져야 한다. WA_DontShowOnScreen 으로 화면엔 안 뜸.
         view = QWebEngineView()
@@ -784,6 +837,11 @@ class NamuLoader(QObject):
                 return qurl, p.name, qurl.toString()
         except Exception:
             pass
+        # https:// 없이 입력한 웹 주소 (naver.com, www.google.com/search?q=…) — 알려진
+        # 도메인 끝자리일 때만. "Node.js" 같은 문서 제목은 그대로 나무위키에서 찾는다.
+        if _DOMAIN_INPUT_RE.match(s):
+            url = "https://" + s
+            return QUrl(url), self._title_from_path(url) or s, url
         # 나무위키 검색창과 같은 /Go 경로 — 띄어쓰기/대소문자가 달라도 문서를 찾아가고,
         # 없으면 검색 결과 페이지로 간다. (/w/제목 은 정확히 일치해야만 열림)
         url = f"https://namu.wiki/Go?q={quote(s, safe='')}"
@@ -819,14 +877,43 @@ class NamuLoader(QObject):
         job.loading = True
         self.loadProgress.emit(rid, 0)
 
-    def _on_loaded(self, rid: int, ok: bool) -> None:
+    def _on_loading_changed(self, rid: int, li) -> None:
+        """로드 결과 판단 — loadFinished 는 오류 종류를 몰라서 이 신호로 한다.
+
+        (loadFinished 가 이 신호보다 먼저 와서, 거기서는 404 와 접속 실패를 구분할 수 없음)
+        """
         job = self._jobs.get(rid)
         if job is None:
             return
+        S = QWebEngineLoadingInfo.LoadStatus
+        st = li.status()
+        if st == S.LoadStartedStatus:
+            job.http_status = None
+            return
+        if st == S.LoadSucceededStatus:
+            self._on_loaded(rid, True)
+        elif st == S.LoadFailedStatus:
+            if li.errorDomain() == QWebEngineLoadingInfo.ErrorDomain.HttpStatusCodeDomain:
+                # 서버가 오류 코드로 응답했지만 안내 페이지는 왔음 (404 등) — 브라우저처럼 보여 줌
+                job.http_status = li.errorCode()
+                self._on_loaded(rid, True)
+            elif li.errorCode() == -3:
+                # ERR_ABORTED — 페이지가 다른 주소로 넘어가느라 앞 로드가 끊김. 새 로드를 기다림
+                return
+            else:
+                self._on_loaded(rid, False, li.errorCode())
+        # LoadStoppedStatus — 로드 중지(다른 로드로 대체 등). 결과는 이어지는 로드가 알려 줌
+
+    def _on_loaded(self, rid: int, ok: bool, net_error: int | None = None) -> None:
+        job = self._jobs.get(rid)
+        if job is None:
+            return
+        job.net_error = net_error
         job.loading = False
         job.gen += 1   # 이전에 걸어 둔 추출 타이머는 무효
         if not ok:
-            self._fail(job, "페이지를 불러오지 못했습니다")
+            code = f" (오류 코드 {job.net_error})" if job.net_error else ""
+            self._fail(job, f"페이지를 불러오지 못했습니다{code}")
             return
         self.pageLoaded.emit(rid)
         self._wait_ready(job, after_change=False)
@@ -910,6 +997,8 @@ class NamuLoader(QObject):
             "pageH": int(info.get("pageH") or 800),
             # 이 문서를 렌더링한 폭 — 창 크기와 다르면 다시 배치 대상
             "renderW": job.view.width(),
+            # 서버가 오류 코드(404 등)로 응답한 페이지면 그 코드 — 상태 표시줄에 알림
+            "httpStatus": job.http_status,
         }
 
     def _on_extracted(self, rid: int, gen: int, result) -> None:
@@ -919,6 +1008,16 @@ class NamuLoader(QObject):
         info = self._parse_result(result)
         ok = bool(info.get("ok"))
         tokens = info.get("tokens") or []
+
+        # 본문이 iframe 안에 있는 사이트 — 바깥 페이지 글자가 거의 없으면 그 iframe 을 직접 연다
+        frame = info.get("frame")
+        if (ok and frame and job.frame_hops < 2 and frame != job.url
+                and int(info.get("textLen") or 0) < 200):
+            job.frame_hops += 1
+            job.attempts = 0
+            job.url = frame
+            job.page.load(QUrl(frame))   # loadFinished → 준비 감시 → 추출 (같은 흐름)
+            return
 
         if ok and tokens:
             url = info.get("url") or job.url

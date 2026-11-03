@@ -297,6 +297,10 @@ class MainWindow(QMainWindow):
         # (새 시트로 열기도 사용자가 직접 그 탭을 눌러야 이동)
         if idx == self._current_sheet:
             self._show_namu(title, doc, url, keep_scroll=req["keep"])
+            if doc.get("httpStatus"):
+                # 브라우저처럼 서버가 보낸 안내 페이지를 보여 주되, 오류 응답임을 알림
+                self.status.setStatusText(
+                    f"서버 응답 {doc['httpStatus']} — 서버가 보낸 안내 페이지입니다 (주소 확인)")
         elif req["bg"]:
             self.status.setStatusText(f"{self.tabs.sheetName(idx)} 준비됨")
         elif "req" not in self._sheets.get(self._current_sheet, {}):
