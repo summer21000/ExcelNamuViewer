@@ -117,7 +117,7 @@ def _is_punct_only(v: str, chars: set[str]) -> bool:
 
 class _Frag:
     __slots__ = ("kind", "text", "x0", "x1", "y0", "y1", "bottom", "blk", "style",
-                 "href", "fn", "src", "ls", "ts", "field")
+                 "href", "fn", "src", "ls", "ts", "field", "tg")
 
     def __init__(self, **kw) -> None:
         for k in self.__slots__:
@@ -147,7 +147,7 @@ def _build_frags(doc: dict, k: float) -> list[_Frag]:
             frags.append(_Frag(
                 kind="v", text="", x0=x * k, x1=(x + w) * k, y0=y * k,
                 y1=y * k + min(h * k, IMAGE_ROW_PX), bottom=(y + h) * k,
-                blk=tok.get("b"), style=None, href=None, fn=None,
+                blk=tok.get("b"), tg=bool(tok.get("tg")), style=None, href=None, fn=None,
                 src=(tok.get("src") or "").strip(),
             ))
             continue
@@ -156,7 +156,7 @@ def _build_frags(doc: dict, k: float) -> list[_Frag]:
                 kind="f", text=(tok.get("ph") or "").strip(),
                 x0=x * k, x1=(x + w) * k, y0=y * k,
                 y1=y * k + min(h * k, IMAGE_ROW_PX), bottom=(y + h) * k,
-                blk=tok.get("b"), style=None, href=None, fn=None,
+                blk=tok.get("b"), tg=bool(tok.get("tg")), style=None, href=None, fn=None,
                 field=int(tok.get("fi") or 0),
             ))
             continue
@@ -172,7 +172,7 @@ def _build_frags(doc: dict, k: float) -> list[_Frag]:
                 kind="i", text=strip_emoji((tok.get("alt") or "").strip()),
                 x0=x * k, x1=(x + w) * k, y0=y * k,
                 y1=y * k + min(h * k, IMAGE_ROW_PX), bottom=(y + h) * k,
-                blk=tok.get("b"), style=None,
+                blk=tok.get("b"), tg=bool(tok.get("tg")), style=None,
                 href=(tok.get("href") or None), fn=(tok.get("fn") or None), src=src,
             ))
             continue
@@ -184,7 +184,7 @@ def _build_frags(doc: dict, k: float) -> list[_Frag]:
         frags.append(_Frag(
             kind="x", text=text,
             x0=x * k, x1=(x + w) * k, y0=y * k, y1=(y + h) * k, bottom=(y + h) * k,
-            blk=tok.get("b"), style=st,
+            blk=tok.get("b"), tg=bool(tok.get("tg")), style=st,
             href=(tok.get("href") or None), fn=(tok.get("fn") or None),
             ls=bool(tok.get("ls")), ts=bool(tok.get("ts")),
         ))
@@ -324,11 +324,15 @@ def format_document(
     r_next = n_title_rows
     cursor = rows[0].top if rows else 0.0
     prev_h = 0.0
+    prev_tight = False
     for row in rows:
         if r_next >= MAX_ROWS:
             break
-        if prev_h and row.top - cursor >= prev_h * PARAGRAPH_GAP:
+        # 붙여 쓰는 영역(사이트 B 글 목록·댓글) 안의 줄끼리는 빈 행을 넣지 않는다
+        tight = all(f.tg for f in row.frags)
+        if prev_h and row.top - cursor >= prev_h * PARAGRAPH_GAP and not (tight and prev_tight):
             r_next += 1
+        prev_tight = tight
         row_of.append(r_next)
         r_next += 1
         h = max(f.y1 - f.y0 for f in row.frags)

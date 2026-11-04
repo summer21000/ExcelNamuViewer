@@ -230,10 +230,13 @@ JSON.stringify((function() {
 
   // 지원 사이트 B 판별 (도메인은 인코딩해 둠)
   var SITE_B = atob('ZGNpbnNpZGUuY29t');
+  // 지원 사이트 B 에서 줄 사이 빈 행 없이 붙여 쓰는 영역 (글 목록, 댓글)
+  var TIGHT_SEL = '.gall_list, .gall_listwrap, .view_comment, .comment_wrap, .comment_box';
   function isSiteB() {
     var h = location.hostname || '';
     return h === SITE_B || h.slice(-(SITE_B.length + 1)) === '.' + SITE_B;
   }
+  var siteB = false;
 
   // 본문 영역만 — 상단 메뉴바 / 우측 사이드바(최근 변경·인기 검색어·광고) 제외.
   // 문서 제목(h1)과 첫 문단 제목(#s-1)을 함께 품는 가장 가까운 요소가 본문 열이다.
@@ -397,6 +400,7 @@ JSON.stringify((function() {
     };
     if (ls) tok.ls = 1;
     if (ts) tok.ts = 1;
+    if (ctx.tg) tok.tg = 1;
     if (ctx.fn) tok.fn = ctx.fn;
     else if (ctx.href) tok.href = ctx.href;
     tokens.push(tok);
@@ -522,6 +526,7 @@ JSON.stringify((function() {
       w: Math.round(r.width), h: Math.round(r.height),
       b: ctx.blk
     };
+    if (ctx.tg) tok.tg = 1;
     if (ctx.fn) tok.fn = ctx.fn;
     else if (ctx.href) tok.href = ctx.href;
     tokens.push(tok);
@@ -608,7 +613,9 @@ JSON.stringify((function() {
       if (isAd(c) || textAds.has(c)) continue;
 
       var n = {href: ctx.href, fn: ctx.fn, clip: ctx.clip, blk: ctx.blk,
-               st: ctx.st, strike: ctx.strike};
+               st: ctx.st, strike: ctx.strike, tg: ctx.tg};
+      // 지원 사이트 B 글 목록·댓글 — 줄 사이에 빈 행을 넣지 않도록 표시
+      if (!n.tg && siteB && c.matches && c.matches(TIGHT_SEL)) n.tg = 1;
       if ((s.textDecorationLine || '').indexOf('line-through') >= 0) n.strike = 1;
 
       var disp = s.display;
@@ -674,7 +681,8 @@ JSON.stringify((function() {
       var side = root.querySelectorAll('.right_content');
       for (var si = 0; si < side.length; si++) textAds.add(side[si]);
     }
-    walk(root, {href: null, fn: null, clip: null, blk: -1,
+    siteB = isSiteB();
+    walk(root, {href: null, fn: null, clip: null, blk: -1, tg: 0,
                 st: styleOf(window.getComputedStyle(root), {}), strike: 0});
     // 이동 대상의 페이지 y 좌표 — 시트에서는 이 높이의 행으로 이동
     var anchors = {};
