@@ -6,7 +6,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFrame, QHeaderView, QMenu, QStyle, QTableView, QToolTip, QWidget,
+    QAbstractItemDelegate, QAbstractItemView, QFrame, QHeaderView, QMenu, QStyle, QTableView, QToolTip, QWidget,
 )
 
 
@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (
 IMAGE_URL_ROLE = Qt.UserRole + 1
 LINK_URL_ROLE = Qt.UserRole + 2
 FOOTNOTE_ROLE = Qt.UserRole + 3
+# 페이지 검색 입력칸 셀 — 값은 페이지 안 입력칸 순번
+FIELD_ROLE = Qt.UserRole + 4
 
 # 나무위키 시트 글꼴 — 페이지도 이 글꼴로 렌더링해서 글자 폭을 맞춤
 DOC_FONT_FAMILY = "Malgun Gothic"
@@ -71,6 +73,7 @@ class SheetView(QTableView):
     linkCellActivated = Signal(str)         # href — 같은 시트에서 열기 (더블클릭 / 메뉴 "열기")
     linkOpenInNewSheet = Signal(str)        # href — 새 시트에서 열기
     linkAddFavorite = Signal(str)           # href — 즐겨찾기에 추가
+    fieldSubmitted = Signal(int, str)       # 검색 셀에 쓰고 Enter — 입력칸 순번, 검색어
     visibleColsChanged = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -206,6 +209,11 @@ class SheetView(QTableView):
                                  footnote=c.footnote, italic=c.italic, strike=c.strike,
                                  base_font=base_font)
                 item.setEditable(False)
+                if c.field is not None:
+                    # 검색 입력칸 — 이 셀만 편집 가능, Enter 로 검색
+                    item.setData(int(c.field), FIELD_ROLE)
+                    item.setEditable(True)
+                    item.setToolTip("검색어를 입력하고 Enter")
                 model.setItem(c.row, c.col, item)
 
         self._build_model(rows, cols, fill)
@@ -403,6 +411,24 @@ class SheetView(QTableView):
         self._frozen.horizontalScrollBar().setValue(0)
 
     # ------------------------------------------------------------------ events
+    def closeEditor(self, editor, hint) -> None:  # noqa: N802 (Qt 이름)
+        # Enter 로 편집을 마친 경우(SubmitModelCache)만 검색 — 다른 셀을 눌러 편집이
+        # 끝난 것(NoHint)이나 Tab 은 검색하지 않는다
+        idx = self.currentIndex()
+        super().closeEditor(editor, hint)
+        if hint == QAbstractItemDelegate.EndEditHint.SubmitModelCache and idx.isValid():
+            self.submitFieldAt(idx)
+
+    def submitFieldAt(self, idx) -> bool:
+        """idx 가 검색 셀이고 글자가 있으면 fieldSubmitted. 검색 셀이었는지 반환."""
+        field = idx.data(FIELD_ROLE)
+        if field is None:
+            return False
+        text = str(idx.data(Qt.EditRole) or "").strip()
+        if text:
+            self.fieldSubmitted.emit(int(field), text)
+        return True
+
     def keyPressEvent(self, e: QKeyEvent) -> None:
         if e.key() == Qt.Key_Delete:
             for idx in self.selectionModel().selectedIndexes():

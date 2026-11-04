@@ -82,10 +82,51 @@ _WAIT_JS = r"""
 _READY_TAG = "__excelview_ready__"
 
 
+# 시트의 검색 셀에 쓴 검색어로 페이지의 검색을 실행 — 입력칸에 넣고, 그 양식의 검색 버튼을
+# 누른다 (버튼이 없으면 Enter 키 / 양식 제출). 사이트가 만드는 검색 주소로 이동하려는 순간
+# _Page 가 그 이동을 가로채서 앱이 그 주소를 평소 링크처럼 연다.
+# 인자: 입력칸 순번(추출 때의 fi), 검색어
+_FIELD_SUBMIT_JS = r"""
+(function(fi, text) {
+  var el = document.querySelectorAll(
+    'input[type="text"],input[type="search"],input:not([type])')[fi];
+  if (!el) return 'nofield';
+  try { el.focus(); } catch (e) {}
+  var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+  setter.call(el, text);
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+  var f = el.form;
+  var btn = f && f.querySelector(
+    'button[type="submit"],input[type="submit"],input[type="image"],button:not([type])');
+  if (btn) { btn.click(); return 'click'; }
+  var o = {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true};
+  var go = el.dispatchEvent(new KeyboardEvent('keydown', o));
+  el.dispatchEvent(new KeyboardEvent('keypress', o));
+  el.dispatchEvent(new KeyboardEvent('keyup', o));
+  if (f && go) {
+    if (f.requestSubmit) f.requestSubmit(); else f.submit();
+    return 'submit';
+  }
+  return 'key';
+})(%s, %s);
+"""
+
+
 class _Page(QWebEnginePage):
     """페이지 안 JS 가 보낸 준비 신호(console 메시지)를 시그널로 바꿔 주는 페이지."""
 
     readySignal = Signal(int)   # 대기 세대
+    # 검색 실행 중 페이지가 다른 주소로 가려 함 — 이동은 막고 주소만 알린다
+    navCaptured = Signal(QUrl)
+    capture_nav = False
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame) -> bool:  # noqa: N802
+        if self.capture_nav and is_main_frame:
+            self.capture_nav = False
+            self.navCaptured.emit(url)
+            return False
+        return super().acceptNavigationRequest(url, nav_type, is_main_frame)
 
     # 숨은 페이지는 대화상자를 띄우지 않는다 — 기본 동작은 보이지 않는 모달 창을 띄우고
     # 응답을 기다려서 다른 시트의 로드까지 멈춘다 (네이버 블로그 "게시물이 삭제…" alert 등).
@@ -187,10 +228,23 @@ JSON.stringify((function() {
     return styleIdx[key];
   }
 
+  // 지원 사이트 B 판별 (도메인은 인코딩해 둠)
+  var SITE_B = atob('ZGNpbnNpZGUuY29t');
+  function isSiteB() {
+    var h = location.hostname || '';
+    return h === SITE_B || h.slice(-(SITE_B.length + 1)) === '.' + SITE_B;
+  }
+
   // 본문 영역만 — 상단 메뉴바 / 우측 사이드바(최근 변경·인기 검색어·광고) 제외.
   // 문서 제목(h1)과 첫 문단 제목(#s-1)을 함께 품는 가장 가까운 요소가 본문 열이다.
   function contentRoot() {
     var body = document.body;
+    // 지원 사이트 B — 제목·글·댓글·목록이 든 main#container 만.
+    // 상단 메뉴, 옆 광고, 하단 분류·약관은 그 바깥에 있다
+    if (isSiteB()) {
+      var sb = document.querySelector('main#container') || document.getElementById('container');
+      if (sb && (sb.innerText || '').trim()) return sb;
+    }
     var h1 = document.querySelector('h1');
     if (!h1) return body;
     var root = null;
@@ -280,6 +334,8 @@ JSON.stringify((function() {
   }
   // overflow:hidden 등으로 잘려 화면에 안 보이는 조각은 버린다.
   function visibleIn(clip, r) {
+    // 페이지 바깥(음수 좌표)에 숨겨 둔 스크린리더용 글자("본문영역 바로가기" 등)
+    if (r.top + r.height + sy <= 0 || r.left + r.width + sx <= 0) return false;
     if (!clip) return true;
     var cx = r.left + sx + r.width / 2, cy = r.top + sy + r.height / 2;
     return cx >= clip.l - 1 && cx <= clip.r + 1 && cy >= clip.t - 1 && cy <= clip.b + 1;
@@ -483,6 +539,30 @@ JSON.stringify((function() {
                  w: Math.round(r.width), h: Math.round(r.height), b: ctx.blk});
   }
 
+  // 검색 입력칸 — 시트에는 입력할 수 있는 빈 셀로. 검색어를 넣고 Enter 를 누르면 앱이
+  // 숨은 페이지의 같은 입력칸(fi = 문서 안 입력칸 순번)에 넣고 그 양식의 검색 버튼을 누른다.
+  // 로그인·댓글 입력칸 등은 빼고 검색용으로 보이는 것만.
+  var FIELD_SEL = 'input[type="text"],input[type="search"],input:not([type])';
+  var allFields = Array.prototype.slice.call(document.querySelectorAll(FIELD_SEL));
+  function pushField(el, ctx) {
+    if (el.disabled || el.readOnly || isAd(el)) return;
+    var hint = [el.name, el.getAttribute('id'), el.getAttribute('class'), el.placeholder,
+                el.getAttribute('aria-label'), el.getAttribute('title')].join(' ');
+    var isSearch = el.type === 'search' || /search|keyword|query|sch|검색/i.test(hint) ||
+                   /^(q|s|k|kw)$/i.test(el.name || '') ||
+                   !!(el.closest && el.closest('[role="search"]'));
+    if (!isSearch) return;
+    var s = window.getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden' || num(s.opacity) === 0) return;
+    var r = el.getBoundingClientRect();
+    if (r.width < 20 || r.height < 8 || !visibleIn(ctx.clip, r)) return;
+    var fi = allFields.indexOf(el);
+    if (fi < 0) return;
+    tokens.push({t: 'f', fi: fi, ph: (el.placeholder || el.getAttribute('title') || '').trim(),
+                 x: Math.round(r.left + sx), y: Math.round(r.top + sy),
+                 w: Math.round(r.width), h: Math.round(r.height), b: ctx.blk});
+  }
+
   var BULLET = {disc: '•', circle: '◦', square: '▪',
                 'disclosure-closed': '▸', 'disclosure-open': '▾'};
   function markerText(li, type) {
@@ -517,6 +597,7 @@ JSON.stringify((function() {
       if (closedDetails && !(c.nodeType === 1 && c.nodeName === 'SUMMARY')) continue;
       if (c.nodeType === 3) { pushText(c, ctx); continue; }
       if (c.nodeType === 1 && c.nodeName === 'IFRAME') { pushEmbed(c, ctx); continue; }
+      if (c.nodeType === 1 && c.nodeName === 'INPUT') { pushField(c, ctx); continue; }
       if (c.nodeType !== 1 || SKIP[c.nodeName]) continue;
       var s;
       try { s = window.getComputedStyle(c); } catch (e) { continue; }
@@ -586,6 +667,11 @@ JSON.stringify((function() {
     }
     var root = contentRoot();
     markTextAds(root);
+    // 지원 사이트 B 글 목록 옆 홍보 영역 — 글 목록은 유지
+    if (isSiteB()) {
+      var side = root.querySelectorAll('.right_content');
+      for (var si = 0; si < side.length; si++) textAds.add(side[si]);
+    }
     walk(root, {href: null, fn: null, clip: null, blk: -1,
                 st: styleOf(window.getComputedStyle(root), {}), strike: 0});
     // 이동 대상의 페이지 y 좌표 — 시트에서는 이 높이의 행으로 이동
@@ -649,6 +735,9 @@ class NamuLoader(QObject):
     relayoutDone = Signal(str, dict)
     fetchFailed = Signal(int, str, str)      # rid, title, 사유
     diagnostics = Signal(int, dict)          # rid, 진단 정보
+    # 시트의 검색 셀로 페이지 검색 실행 → 이동할 검색 결과 주소: 검색한 문서 주소, 결과 주소
+    fieldNavigation = Signal(str, str)
+    fieldFailed = Signal(str)                # 사유
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -681,12 +770,91 @@ class NamuLoader(QObject):
 
         self._debug_view: QWebEngineView | None = None
 
+        # 진행 중인 검색 (submitField) — page, url(검색한 문서), seq, temp(따로 연 페이지인지)
+        self._submit: dict | None = None
+        self._submit_seq = 0
+
+    # ------------------------------------------------------------------ search field
+    def submitField(self, page_url: str, field: int, text: str) -> None:
+        """page_url 문서의 검색 입력칸(field 번)에 text 로 검색 → fieldNavigation / fieldFailed."""
+        self._end_submit()
+        job = self._ready if (self._ready is not None and self._ready.url == page_url) else None
+        if job is not None:
+            self._submit_on(job.page, page_url, field, text, temp=False)
+            return
+        # 다른 문서가 열려 있음 — 이 문서를 숨은 페이지로 다시 열어서 검색
+        page = _Page(self._profile, self)
+        page.navCaptured.connect(lambda u, p=page: self._on_nav_captured(p, u))
+        started = {"done": False}
+
+        def on_loaded(ok: bool) -> None:
+            if started["done"] or self._submit is None or self._submit["page"] is not page:
+                return
+            started["done"] = True
+            if not ok:
+                self._fail_submit("검색할 페이지를 다시 불러오지 못했습니다")
+                return
+            self._submit_on(page, page_url, field, text, temp=True)
+
+        self._submit_seq += 1
+        self._submit = {"page": page, "url": page_url, "seq": self._submit_seq, "temp": True}
+        page.loadFinished.connect(on_loaded)
+        page.load(QUrl(page_url))
+        seq = self._submit_seq
+        QTimer.singleShot(20000, lambda: self._submit_timeout(seq))
+
+    def _submit_on(self, page: QWebEnginePage, page_url: str, field: int, text: str,
+                   temp: bool) -> None:
+        self._submit_seq += 1
+        seq = self._submit_seq
+        self._submit = {"page": page, "url": page_url, "seq": seq, "temp": temp}
+        page.capture_nav = True
+        js = _FIELD_SUBMIT_JS % (int(field), json.dumps(text))
+        page.runJavaScript(js, lambda res, s=seq: self._on_submit_js(s, res))
+        QTimer.singleShot(5000, lambda: self._submit_timeout(seq))
+
+    def _on_submit_js(self, seq: int, res) -> None:
+        if self._submit is not None and self._submit["seq"] == seq and res == "nofield":
+            self._fail_submit("페이지에서 검색창을 찾지 못했습니다")
+
+    def _on_nav_captured(self, page: QWebEnginePage, url: QUrl) -> None:
+        sub = self._submit
+        if sub is None or sub["page"] is not page:
+            return
+        self._end_submit()
+        self.fieldNavigation.emit(sub["url"], url.toString())
+
+    def _submit_timeout(self, seq: int) -> None:
+        if self._submit is not None and self._submit["seq"] == seq:
+            self._fail_submit("검색 결과로 이동하지 못했습니다")
+
+    def _fail_submit(self, msg: str) -> None:
+        self._end_submit()
+        self.fieldFailed.emit(msg)
+
+    def _end_submit(self) -> None:
+        sub, self._submit = self._submit, None
+        if sub is None:
+            return
+        page = sub["page"]
+        try:
+            page.capture_nav = False
+        except Exception:
+            pass
+        if sub["temp"]:
+            try:
+                page.triggerAction(QWebEnginePage.WebAction.Stop)
+                page.deleteLater()
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------ pages
     def _new_job(self, title: str, url: str) -> _Job:
         self._next_rid += 1
         rid = self._next_rid
         page = _Page(self._profile, self)
         page.readySignal.connect(lambda g, r=rid: self._on_ready(r, g))
+        page.navCaptured.connect(lambda u, p=page: self._on_nav_captured(p, u))
         page.loadStarted.connect(lambda r=rid: self._on_page_load_started(r))
         page.loadProgress.connect(lambda p, r=rid: self._on_progress(r, p))
         # 로드 결과는 loadingChanged 로만 판단 (성공/서버 오류 응답/접속 실패/중단 구분)
@@ -784,6 +952,7 @@ class NamuLoader(QObject):
                 self._debug_view = None
         except Exception:
             pass
+        self._end_submit()
         for job in list(self._jobs.values()):
             self._destroy(job)
         self._jobs.clear()

@@ -54,6 +54,8 @@ class CellSpec:
     image: str | None = None
     link: str | None = None
     footnote: str | None = None
+    # 검색 입력칸 — 페이지 안 입력칸 순번 (이 셀에 검색어를 쓰고 Enter 로 검색)
+    field: int | None = None
 
 
 @dataclass
@@ -85,7 +87,7 @@ def _is_punct_only(v: str, chars: set[str]) -> bool:
 
 class _Frag:
     __slots__ = ("kind", "text", "x0", "x1", "y0", "y1", "bottom", "blk", "style",
-                 "href", "fn", "src", "ls", "ts")
+                 "href", "fn", "src", "ls", "ts", "field")
 
     def __init__(self, **kw) -> None:
         for k in self.__slots__:
@@ -117,6 +119,15 @@ def _build_frags(doc: dict, k: float) -> list[_Frag]:
                 y1=y * k + min(h * k, IMAGE_ROW_PX), bottom=(y + h) * k,
                 blk=tok.get("b"), style=None, href=None, fn=None,
                 src=(tok.get("src") or "").strip(),
+            ))
+            continue
+        if tok.get("t") == "f":
+            frags.append(_Frag(
+                kind="f", text=(tok.get("ph") or "").strip(),
+                x0=x * k, x1=(x + w) * k, y0=y * k,
+                y1=y * k + min(h * k, IMAGE_ROW_PX), bottom=(y + h) * k,
+                blk=tok.get("b"), style=None, href=None, fn=None,
+                field=int(tok.get("fi") or 0),
             ))
             continue
         if tok.get("t") == "i":
@@ -316,7 +327,10 @@ def format_document(
             if n_cols - wrap_col < MIN_WRAP_COLS:
                 wrap_col = 0
             st = f.style or {}
-            if f.kind == "v":
+            if f.kind == "f":
+                # 빈 셀 하나 — 검색어를 쓰는 자리
+                base = CellSpec(out_r, 0, "", field=f.field)
+            elif f.kind == "v":
                 base = CellSpec(out_r, 0, "[동영상] " + f.src)
             elif f.kind == "i":
                 label = "[사진보기]" + (f" — {f.text}" if f.text else "")
@@ -334,7 +348,9 @@ def format_document(
             else:
                 c = max(natural, cursor_col)
             bold = base.bold
-            for piece in _chunks(base.text, cell_text_px, lambda t: width(t, bold)):
+            pieces = [""] if f.kind == "f" else _chunks(base.text, cell_text_px,
+                                                        lambda t: width(t, bold))
+            for piece in pieces:
                 if c >= n_cols:
                     line += 1
                     c = wrap_col

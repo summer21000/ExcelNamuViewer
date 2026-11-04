@@ -137,12 +137,15 @@ class MainWindow(QMainWindow):
         self.loader.relayoutDone.connect(self._on_relayout_done)
         self.loader.fetchFailed.connect(self._on_fetch_failed)
         self.loader.diagnostics.connect(self._on_diagnostics)
+        self.loader.fieldNavigation.connect(self._on_field_navigation)
+        self.loader.fieldFailed.connect(lambda msg: self.status.setStatusText(msg))
 
         self.sheet.cellSelected.connect(self._on_cell_selected)
         self.sheet.imageCellActivated.connect(self._on_image_cell)
         self.sheet.linkCellActivated.connect(self._on_link_cell)
         self.sheet.linkOpenInNewSheet.connect(self._on_link_cell_new_sheet)
         self.sheet.linkAddFavorite.connect(self._on_link_add_favorite)
+        self.sheet.fieldSubmitted.connect(self._on_field_submitted)
         self.ribbon.favoritesRequested.connect(self._show_favorites_menu)
         self.sheet.visibleColsChanged.connect(self._on_visible_cols)
         self.tabs.sheetChanged.connect(self._on_sheet_changed)
@@ -725,6 +728,21 @@ class MainWindow(QMainWindow):
         cur = self.sheet.selectionModel().currentIndex()
         if cur.isValid():
             self.sheet.setCellValue(cur.row(), cur.column(), text)
+            # 검색 셀이면 수식 입력줄에서 Enter 해도 검색
+            self.sheet.submitFieldAt(cur)
+
+    def _on_field_submitted(self, field: int, text: str) -> None:
+        """페이지 검색 셀에 검색어를 쓰고 Enter — 숨은 페이지에서 그 검색을 실행."""
+        if self._sheets.get(self._current_sheet, {}).get("type") != "namu" or not self._last_url:
+            return
+        self.status.setStatusText(f"'{text}' 검색 중...")
+        self.loader.submitField(self._last_url, field, text)
+
+    def _on_field_navigation(self, page_url: str, href: str) -> None:
+        # 검색한 문서를 아직 보고 있을 때만 — 그 사이 다른 문서/시트로 옮겼으면 버림
+        if (self._sheets.get(self._current_sheet, {}).get("type") == "namu"
+                and self._last_url == page_url):
+            self._on_link_cell(href)
 
     def _on_image_cell(self, url: str, label: str) -> None:
         if not url:
