@@ -19,6 +19,8 @@ FIELD_ROLE = Qt.UserRole + 4
 
 # 나무위키 시트 글꼴 — 페이지도 이 글꼴로 렌더링해서 글자 폭을 맞춤
 DOC_FONT_FAMILY = "Malgun Gothic"
+# 사진보기·이동 링크 글자색 — 본문보다 살짝 푸른 남색, 밑줄 없음 (눈에 덜 띄게)
+LINK_COLOR = "#2f4f7f"
 
 
 def column_letter(col: int) -> str:
@@ -145,18 +147,12 @@ class SheetView(QTableView):
 
         if image_url:
             item.setData(image_url, IMAGE_URL_ROLE)
-            item.setForeground(QBrush(QColor("#0563c1")))
-            f = item.font()
-            f.setUnderline(True)
-            item.setFont(f)
+            item.setForeground(QBrush(QColor(LINK_COLOR)))
             item.setToolTip("더블 클릭하면 사진이 뜹니다")
             item.setEditable(False)
         elif link_url:
             item.setData(link_url, LINK_URL_ROLE)
-            item.setForeground(QBrush(QColor("#0563c1")))
-            f = item.font()
-            f.setUnderline(True)
-            item.setFont(f)
+            item.setForeground(QBrush(QColor(LINK_COLOR)))
             item.setToolTip(link_title(link_url))
             item.setEditable(False)
 

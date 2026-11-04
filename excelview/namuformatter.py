@@ -13,8 +13,38 @@ from __future__ import annotations
     기본 행 높이를 쓰고, 문단 사이 간격은 빈 행 한 줄로만 남긴다.
 """
 
+import re
 from dataclasses import dataclass, field, replace
 from typing import Callable
+
+# 그림 문자(이모지) — 엑셀 셀에 그대로 찍히면 눈에 띄므로 지운다.
+#   보조 평면 그림 문자·국기·피부색, 기본이 그림으로 보이는 BMP 기호, 결합용 문자(ZWJ·VS16·키캡·태그)
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"
+    "\U000E0020-\U000E007F"
+    "\u231A\u231B\u23E9-\u23EC\u23F0\u23F3\u25FD\u25FE\u2614\u2615"
+    "\u2648-\u2653\u267F\u2693\u26A1\u26AA\u26AB\u26BD\u26BE\u26C4\u26C5"
+    "\u26CE\u26D4\u26EA\u26F2\u26F3\u26F5\u26FA\u26FD\u2705\u270A\u270B"
+    "\u2728\u274C\u274E\u2753-\u2755\u2757\u2795-\u2797\u27B0\u27BF"
+    "\u2B1B\u2B1C\u2B50\u2B55"
+    "\u200D\u20E3"
+    "]"
+    # 글자 기호 + VS16(그림으로 보이게 하는 표시) — 기호까지 같이 지움 (예: 해·하트·체크 그림)
+    "|[\u00A9\u00AE\u203C\u2049\u2122\u2139\u2194-\u21AA\u2300-\u27BF\u2934\u2935"
+    "\u2B05-\u2B55\u3030\u303D\u3297\u3299]\uFE0F"
+    "|\uFE0F"
+)
+_SPACES_RE = re.compile(r"\s{2,}")
+
+
+def strip_emoji(text: str) -> str:
+    if not text:
+        return text
+    out = _EMOJI_RE.sub("", text)
+    if out == text:
+        return text
+    return _SPACES_RE.sub(" ", out).strip()
 
 # 시트 기본 열 너비 (px, 배율 100%) — 위장 시트와 같음
 COL_PX = 82
@@ -139,14 +169,14 @@ def _build_frags(doc: dict, k: float) -> list[_Frag]:
                 continue
             seen_img.add(key)
             frags.append(_Frag(
-                kind="i", text=(tok.get("alt") or "").strip(),
+                kind="i", text=strip_emoji((tok.get("alt") or "").strip()),
                 x0=x * k, x1=(x + w) * k, y0=y * k,
                 y1=y * k + min(h * k, IMAGE_ROW_PX), bottom=(y + h) * k,
                 blk=tok.get("b"), style=None,
                 href=(tok.get("href") or None), fn=(tok.get("fn") or None), src=src,
             ))
             continue
-        text = (tok.get("v") or "").strip()
+        text = strip_emoji((tok.get("v") or "").strip())
         if not text:
             continue
         si = tok.get("s")
@@ -273,6 +303,7 @@ def format_document(
     # ---- 제목 행 (1행, 스크롤과 함께 움직임) — 제목도 셀 너비만큼 잘라 이어 쓴다.
     #      본문은 바로 2행부터
     n_title_rows = 0
+    title = strip_emoji(title or "")
     if title:
         for i, piece in enumerate(_chunks(title, cell_text_px, lambda t: width(t, True))[:n_cols]):
             lay.cells.append(CellSpec(0, i, piece, bold=True))

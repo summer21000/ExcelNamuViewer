@@ -511,6 +511,8 @@ JSON.stringify((function() {
   }
 
   function pushImage(el, ctx) {
+    // 지원 사이트 B 글쓴이 닉네임 옆 작은 아이콘 — 대체 글자("…로 이동합니다")가 셀에 찍히므로 제외
+    if (isSiteB() && el.closest && el.closest('.writer_nikcon')) return;
     var r = el.getBoundingClientRect();
     if (r.width < 6 && r.height < 6) return;
     if (!visibleIn(ctx.clip, r)) return;
